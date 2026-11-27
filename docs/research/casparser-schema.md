@@ -146,7 +146,10 @@ In real `casparser` outputs (`DETAILED` CAMS/KFintech statements), unit conserva
    - Walks from `prev_balance = scheme.open` with tolerance `0.005`.
    - If `abs((prev_balance + units) - balance) > 0.005` **and** `abs((prev_balance - units) - balance) <= 0.005`, `casparser` flips `t.units = -units`, `t.amount = -amount` (if present), and reclassifies `t.type` via `get_transaction_type`. It then recomputes `scheme.close_calculated`.
 3. **Scheme-Level Conservation Equation & Tolerances**:
-   $$\text{open} + \sum_{t \in \text{transactions},\; t.\text{units} \neq \text{null}} t.\text{units} = \text{close\_calculated} \approx \text{close}$$
+
+   ```math
+   \text{open} + \sum_{t \in \text{transactions},\; t.\text{units} \neq \text{null}} t.\text{units} = \text{close\_calculated} \approx \text{close}
+   ```
    - **Parser reconciliation (`_reconcile_balances`)**: Uses tolerance `Decimal("0.005")`. Checks every row with non-null `t.balance` (`abs(running - printed) <= 0.005`), resyncing on mismatch and appending a string to `parse_warnings`, then checks `abs(running - scheme.close) <= 0.005`.
    - **Test-suite invariant (`assert_scheme_transaction_units_close`)**: Enforces `abs(scheme.open + sum_units - scheme.close) <= Decimal("0.001")` (3-decimal CAS unit precision).
    - **Valuation cross-check (`assert_scheme_valuation_arithmetic`)**: Checks `scheme.close * scheme.valuation.nav ≈ scheme.valuation.value` within `0.5%` relative tolerance (when `close == 0`, `value == 0`).
