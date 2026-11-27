@@ -10,7 +10,7 @@ ReconcileX reconciles each account's computed ledger balance against the institu
 
 ## Decision
 
-`EMI_REPAYMENT` transactions in the internal `LIABILITY` ingestion contract carry explicit `principalComponent`, `interestComponent`, and `feeComponent` fields (whose sum must equal `amount`, defaulting to `100%` principal if omitted). Ingestion posts only `principalComponent` as a reduction to `LIABILITY:LOAN` and routes `interestComponent` and `feeComponent` to `EXPENSE:LOAN_INTEREST` / `EQUITY:EXTERNAL_CLEARING`, keeping `LIABILITY:LOAN` equal to exact unpaid principal.
+`EMI_REPAYMENT` transactions in the internal `LIABILITY` ingestion contract carry explicit `principalComponent`, `interestComponent`, and `feeComponent` fields (whose sum must equal `amount`, defaulting to `100%` principal if omitted). Ingestion posts only `principalComponent` as a reduction to `LIABILITY:LOAN` and routes `interestComponent` to `EXPENSE:LOAN_INTEREST` and `feeComponent` to `EXPENSE:LOAN_FEES` against `EQUITY:EXTERNAL_CLEARING`, keeping `LIABILITY:LOAN` equal to exact unpaid principal.
 
 ## Considered Options
 
@@ -20,4 +20,4 @@ ReconcileX reconciles each account's computed ledger balance against the institu
 ## Consequences
 
 - `LIABILITY:LOAN` tracks exact remaining loan principal and reconciles directly against `Summary.outstandingBalance` with zero false-positive drift.
-- Ticket #7's Chart of Accounts enum must include an interest/fee expense account (`EXPENSE:LOAN_INTEREST`) alongside `EXPENSE:UPI_SPEND` and `EXPENSE:TAX_STAMP_DUTY`.
+- Ticket #7's Chart of Accounts enum separates loan and credit card borrowing costs into `EXPENSE:LOAN_INTEREST`, `EXPENSE:LOAN_FEES`, `EXPENSE:CARD_INTEREST`, and `EXPENSE:CARD_FEES` alongside `EXPENSE:UPI_SPEND` and `EXPENSE:TAX_STAMP_DUTY`.

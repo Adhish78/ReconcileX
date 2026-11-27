@@ -34,6 +34,36 @@ _Avoid_: Finance charge, interest debit
 The minimal set of double-entry ledger accounts used to guarantee zero-sum balancing across assets, liabilities, clearing equity, income, and expenses.
 _Avoid_: Category list, spending buckets
 
+**External Clearing**:
+The `EQUITY:EXTERNAL_CLEARING` balancing account in the **Chart of Accounts** that lets each financial container balance independently without fragile cross-source matching.
+_Avoid_: Suspense account, offset bucket
+
+### Identity, Ledger & Reconciliation
+
+**Canonical User**:
+A deduplicated person record owning **Linked Identities** and accounts, consolidated via **Entity Merge** when shared verified identifiers are discovered.
+_Avoid_: Customer, login, profile
+
+**Linked Identity**:
+A hashed external identifier (`PAN_HASH`, `MOBILE_HASH`, or `EMAIL_HASH`) bound to a **Canonical User** with verification status and source provenance.
+_Avoid_: Credential, auth token, identifier
+
+**Ledger Transaction**:
+An atomic financial event on a single account (from AA, CAS, or Liability ingestion, or an `OPENING_ANCHOR`) whose **Ledger Entries** sum to zero.
+_Avoid_: Journal batch, posting group
+
+**Ledger Entry**:
+An immutable signed monetary and optional unit delta against one **Chart of Accounts** bucket belonging to a **Ledger Transaction**.
+_Avoid_: Line item, split, row
+
+**Reconciliation Alert**:
+An open, acknowledged, or resolved discrepancy (`BALANCE_DRIFT`, `VALUATION_DRIFT`, or `UNIT_DRIFT`) between a computed ledger or NAV value and an institution-reported figure on an account.
+_Avoid_: Drift warning, audit error
+
+**Entity Merge**:
+The auditable consolidation of two **Canonical Users** triggered by matching a `PAN_HASH` or verified `MOBILE_HASH`, reassigning accounts and **Linked Identities** while soft-marking the superseded user.
+_Avoid_: User deduplication, account linking
+
 ### Categorization
 
 **Narration**:
