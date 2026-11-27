@@ -56,6 +56,14 @@ _Avoid_: Journal batch, posting group
 An immutable signed monetary and optional unit delta against one **Chart of Accounts** bucket belonging to a **Ledger Transaction**.
 _Avoid_: Line item, split, row
 
+**Opening Anchor**:
+A synthetic **Ledger Transaction** recorded on first ingestion of a partial statement window to establish the pre-window starting balance or unit count against **External Clearing** (or as a unit-only **Ledger Entry**).
+_Avoid_: Seed balance, backfill row
+
+**Unit Checksum**:
+The pre-ledger conservation invariant verifying that a mutual fund statement's opening units plus unit-bearing transaction deltas match its printed closing units, routing failing statements to dead-letter handling.
+_Avoid_: Share count check, unit balance alert
+
 **Reconciliation Alert**:
 An open, acknowledged, or resolved discrepancy (`BALANCE_DRIFT`, `VALUATION_DRIFT`, or `UNIT_DRIFT`) between a computed ledger or NAV value and an institution-reported figure on an account.
 _Avoid_: Drift warning, audit error

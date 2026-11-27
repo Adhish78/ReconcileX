@@ -10,7 +10,7 @@ ReconcileX requires strict zero-sum double-entry accounting across multi-source 
 
 ## Decision
 
-`ledger_entries` stores signed monetary deltas (`NUMERIC(18,4)`) and optional unit deltas (`NUMERIC(18,6)`), guarded by a `DEFERRABLE INITIALLY DEFERRED` constraint trigger enforcing `SUM(amount) = 0` per `transaction_id` and a strict append-only trigger blocking `UPDATE` and `DELETE`. `canonical_user_id` is stored on `accounts` rather than `ledger_transactions`, and `ledger_transactions` permits `UPDATE` solely on `(category, category_updated_at)` so entity merges and human review never mutate accounting legs.
+`ledger_entries` stores signed monetary deltas (`NUMERIC(18,4)`) and optional unit deltas (`NUMERIC(18,6)`)—enforcing `CHECK (amount <> 0 OR (units IS NOT NULL AND units <> 0))` so zero-cash unit events (`BONUS`, `SPLIT`, `SEGREGATION`, costless `OPENING_ANCHOR`) record exact unit deltas without synthetic `₹0.0001` cash—guarded by a `DEFERRABLE INITIALLY DEFERRED` constraint trigger enforcing `SUM(amount) = 0` per `transaction_id` and a strict append-only trigger blocking `UPDATE` and `DELETE`. `canonical_user_id` is stored on `accounts` rather than `ledger_transactions`, and `ledger_transactions` permits `UPDATE` solely on `(category, category_updated_at)` so entity merges and human review never mutate accounting legs.
 
 ## Considered Options
 
