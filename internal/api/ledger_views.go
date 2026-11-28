@@ -203,9 +203,16 @@ func (s *server) handleGetAccounts(w http.ResponseWriter, r *http.Request) {
 			a.scheme_code,
 			COALESCE(a.metadata->>'scheme_name', ''),
 			a.currency,
-			COALESCE(SUM(le.amount) FILTER (
-				WHERE le.coa_account IN ('ASSET:BANK', 'ASSET:MF_COST', 'ASSET:EQUITY_COST', 'LIABILITY:LOAN', 'LIABILITY:CARD')
-			), 0)::NUMERIC(18,4)::text AS ledger_balance,
+			CASE
+				WHEN a.source_type IN ('HOME_LOAN', 'AUTO_LOAN') THEN
+					ABS(COALESCE(SUM(le.amount) FILTER (
+						WHERE le.coa_account = 'LIABILITY:LOAN'
+					), 0))::NUMERIC(18,4)::text
+				ELSE
+					COALESCE(SUM(le.amount) FILTER (
+						WHERE le.coa_account IN ('ASSET:BANK', 'ASSET:MF_COST', 'ASSET:EQUITY_COST', 'LIABILITY:CARD')
+					), 0)::NUMERIC(18,4)::text
+			END AS ledger_balance,
 			CASE
 				WHEN a.source_type = 'MUTUAL_FUND' THEN
 					COALESCE(SUM(le.units) FILTER (
@@ -597,7 +604,7 @@ func (s *server) handleGetPortfolioSummary(w http.ResponseWriter, r *http.Reques
 		case "EQUITY":
 			equities, err = equities.Add(amt)
 		case "HOME_LOAN", "AUTO_LOAN":
-			loans, err = loans.Add(amt)
+			loans, err = loans.Add(amt.Neg())
 		case "CREDIT_CARD":
 			creditCards, err = creditCards.Add(amt)
 		}
