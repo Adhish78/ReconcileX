@@ -1,12 +1,20 @@
 <!doctype html>
+<!--
+  Root HTML document served by Vite in dev mode and compiled into web/dist/index.html
+  for embedding into the Go binary via web/embed.go.
+-->
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>ReconcileX — Double-Entry Wealth & Liability Reconciliation</title>
   </head>
+
   <body>
+    <!-- Target container where src/main.tsx mounts the React component tree -->
     <div id="root"></div>
+
+    <!-- Module entry script; Vite rewrites this to the hashed production JS bundle on build -->
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

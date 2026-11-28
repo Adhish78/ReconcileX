@@ -1,4 +1,21 @@
+# =============================================================================
+# ReconcileX Docker Compose Stack
+#
+#   Default (`docker compose up`): starts strictly two runtime services:
+#     1. `postgres`: persistent PostgreSQL 19 showcase database.
+#     2. `reconcilex`: single Go binary serving API + embedded React UI on :8080.
+#
+#   Isolated tests (`docker compose --profile test ...`): spins up an ephemeral
+#   tmpfs `postgres-test`, `test-go` (`go test -race`), and `test-web`
+#   (`npm run typecheck && npm test`) without touching runtime volumes.
+# =============================================================================
+
 services:
+  # ---------------------------------------------------------------------------
+  # Runtime Services (active by default)
+  # ---------------------------------------------------------------------------
+
+  # Primary PostgreSQL 19 instance persisting runtime data across restarts.
   postgres:
     image: postgres:19-alpine
     environment:
@@ -7,12 +24,15 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-reconcilex}
     volumes:
       - reconcilex_pgdata:/var/lib/postgresql
+
+    # Gate `reconcilex` startup until PostgreSQL accepts authenticated queries.
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-reconcilex} -d ${POSTGRES_DB:-reconcilex}"]
       interval: 2s
       timeout: 3s
       retries: 15
 
+  # Single-binary Go server embedding SQL migrations and the compiled React SPA.
   reconcilex:
     build: .
     depends_on:
@@ -23,13 +43,23 @@ services:
     environment:
       RECONCILEX_DSN: postgres://${POSTGRES_USER:-reconcilex}:${POSTGRES_PASSWORD:-reconcilex}@postgres:5432/${POSTGRES_DB:-reconcilex}?sslmode=disable
       RECONCILEX_PORT: "8080"
+      # Run embedded SQL migrations automatically on boot for zero-setup startup.
       RECONCILEX_AUTO_MIGRATE: "true"
+
+    # Poll /readyz so Docker confirms both PostgreSQL connectivity and applied migrations.
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/readyz >/dev/null || exit 1"]
       interval: 3s
       timeout: 3s
       retries: 15
 
+
+  # ---------------------------------------------------------------------------
+  # Isolated Test Profile (`docker compose --profile test ...`)
+  # ---------------------------------------------------------------------------
+
+  # Ephemeral PostgreSQL 19 instance backed by in-memory tmpfs so test runs are fast
+  # and never contaminate the `reconcilex_pgdata` runtime volume.
   postgres-test:
     profiles: ["test"]
     image: postgres:19-alpine
@@ -45,30 +75,37 @@ services:
       timeout: 3s
       retries: 15
 
+  # Executes Go unit and DB integration tests with the `-race` detector enabled.
   test-go:
     profiles: ["test"]
     image: golang:1.27.4-alpine
     working_dir: /app
     volumes:
       - .:/app
+      # Persist downloaded Go modules across runs in a Docker volume.
       - reconcilex_test_gomod:/go/pkg/mod
     depends_on:
       postgres-test:
         condition: service_healthy
     environment:
       RECONCILEX_TEST_DSN: postgres://${POSTGRES_TEST_USER:-reconcilex}:${POSTGRES_TEST_PASSWORD:-reconcilex}@postgres-test:5432/${POSTGRES_TEST_DB:-reconcilex_test}?sslmode=disable
+      # CGO + gcc/musl-dev are required on Alpine to compile Go's race detector runtime.
       CGO_ENABLED: "1"
     command: ["sh", "-c", "apk add --no-cache gcc musl-dev >/dev/null && go test -v -race ./..."]
 
+  # Executes strict TypeScript type-checking and Vitest component tests in isolation.
   test-web:
     profiles: ["test"]
     image: node:26-alpine
     working_dir: /app/web
     volumes:
       - ./web:/app/web
+      # Keep container node_modules in a named volume separate from the host filesystem.
       - reconcilex_test_web_node_modules:/app/web/node_modules
     command: ["sh", "-c", "npm ci --silent && npm run typecheck && npm test"]
 
+
+# Named volumes shared across container restarts for runtime DB state and test caches.
 volumes:
   reconcilex_pgdata:
   reconcilex_test_gomod:

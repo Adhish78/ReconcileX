@@ -1,9 +1,18 @@
+# Exclude VCS history, agent workspace files, and local scratch artifacts from
+# the Docker build context so image builds stay fast and clean.
 .git
 .agents
 .scratch
+
+# Exclude host dependencies so Stage 1 installs fresh Linux binaries via `npm ci`.
 web/node_modules
+
+# Ignore local Vite output so Stage 1 always builds from source, while preserving
+# web/dist/.gitkeep so Go's `//go:embed all:dist` always finds the directory.
 web/dist/*
 !web/dist/.gitkeep
+
+# Exclude locally compiled binaries, test binaries, and coverage profiles.
 *.exe
 *.test
 *.out
