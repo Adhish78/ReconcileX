@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Adhish78/ReconcileX/internal/aa"
 	"github.com/Adhish78/ReconcileX/internal/db"
 	"github.com/Adhish78/ReconcileX/internal/worker"
 	"github.com/Adhish78/ReconcileX/migrations"
@@ -797,5 +798,422 @@ func TestConcurrentWorkersAndStaleLeaseSweeperNoDoublePosting(t *testing.T) {
 	}
 	if txnCount != jobCount || bankBal != "1000.0000" {
 		t.Fatalf("expected %d txns and 1000.0000 balance, got txns=%d bal=%s", jobCount, txnCount, bankBal)
+	}
+}
+
+// TestWorkerOpeningAnchorDerivationAndDeduplication verifies Opening Anchor
+// derivation on first ingestion (both from T_0.transactionalBalance and empty-txn
+// Summary.currentBalance), zero-start accounts, and no duplicate anchors on
+// subsequent overlapping or forward ingests.
+func TestWorkerOpeningAnchorDerivationAndDeduplication(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	pool := openWorkerTestPool(t)
+	var userID string
+	if err := pool.QueryRow(ctx,
+		`INSERT INTO users (persona_slug, display_name) VALUES ('aarav', 'Aarav Sharma') RETURNING id::text`,
+	).Scan(&userID); err != nil {
+		t.Fatalf("insert user: %v", err)
+	}
+
+	// Case 1: Partial window where T_0 (DEBIT 1500, post-balance 8500) implies Opening Anchor +10000.
+	p1 := `{
+		"fipId": "HDFC-FIP",
+		"institutionName": "HDFC Bank",
+		"Account": {
+			"type": "deposit",
+			"maskedAccNumber": "XXXXXXXX4020",
+			"version": "2.0.0",
+			"linkedAccRef": "HDFC-ANCHOR-1",
+			"Summary": {"currentBalance": "10500.00", "currency": "INR", "balanceDateTime": "2026-06-06T12:00:00+05:30"},
+			"Transactions": {
+				"startDate": "2026-06-01",
+				"endDate": "2026-06-06",
+				"Transaction": [
+					{
+						"txnId": "ANCH-T0",
+						"type": "DEBIT",
+						"mode": "UPI",
+						"amount": "1500.00",
+						"transactionalBalance": "8500.00",
+						"transactionTimestamp": "2026-06-05T10:00:00+05:30",
+						"narration": "UPI/DR/MERCHANT"
+					},
+					{
+						"txnId": "ANCH-T1",
+						"type": "CREDIT",
+						"mode": "NEFT",
+						"amount": "2000.00",
+						"transactionalBalance": "10500.00",
+						"transactionTimestamp": "2026-06-06T12:00:00+05:30",
+						"narration": "NEFT/REFUND"
+					}
+				]
+			}
+		}
+	}`
+	// Overlapping window replaying ANCH-T1 and adding ANCH-T2 (-500), plus non-overlapping forward window ANCH-T3 (+1000).
+	p2 := `{
+		"fipId": "HDFC-FIP",
+		"institutionName": "HDFC Bank",
+		"Account": {
+			"type": "deposit",
+			"maskedAccNumber": "XXXXXXXX4020",
+			"version": "2.0.0",
+			"linkedAccRef": "HDFC-ANCHOR-1",
+			"Summary": {"currentBalance": "10000.00", "currency": "INR", "balanceDateTime": "2026-06-10T14:00:00+05:30"},
+			"Transactions": {
+				"startDate": "2026-06-06",
+				"endDate": "2026-06-10",
+				"Transaction": [
+					{
+						"txnId": "ANCH-T1",
+						"type": "CREDIT",
+						"mode": "NEFT",
+						"amount": "2000.00",
+						"transactionalBalance": "10500.00",
+						"transactionTimestamp": "2026-06-06T12:00:00+05:30",
+						"narration": "NEFT/REFUND"
+					},
+					{
+						"txnId": "ANCH-T2",
+						"type": "DEBIT",
+						"mode": "UPI",
+						"amount": "500.00",
+						"transactionalBalance": "10000.00",
+						"transactionTimestamp": "2026-06-10T14:00:00+05:30",
+						"narration": "UPI/DR/CAFE"
+					}
+				]
+			}
+		}
+	}`
+	p3 := `{
+		"fipId": "HDFC-FIP",
+		"institutionName": "HDFC Bank",
+		"Account": {
+			"type": "deposit",
+			"maskedAccNumber": "XXXXXXXX4020",
+			"version": "2.0.0",
+			"linkedAccRef": "HDFC-ANCHOR-1",
+			"Summary": {"currentBalance": "11000.00", "currency": "INR", "balanceDateTime": "2026-06-15T09:00:00+05:30"},
+			"Transactions": {
+				"startDate": "2026-06-11",
+				"endDate": "2026-06-15",
+				"Transaction": [{
+					"txnId": "ANCH-T3",
+					"type": "CREDIT",
+					"mode": "IMPS",
+					"amount": "1000.00",
+					"transactionalBalance": "11000.00",
+					"transactionTimestamp": "2026-06-15T09:00:00+05:30",
+					"narration": "IMPS/CR/CLIENT"
+				}]
+			}
+		}
+	}`
+
+	// Case 2: Empty-transaction first ingest derives Opening Anchor from Summary.currentBalance,
+	// then forward ingest adds a transaction at 01:00 IST on startDate (verifying IST midnight boundary).
+	emptyFirst := `{
+		"fipId": "ICICI-FIP",
+		"institutionName": "ICICI Bank",
+		"Account": {
+			"type": "deposit",
+			"maskedAccNumber": "XXXXXXXX5500",
+			"version": "2.0.0",
+			"linkedAccRef": "ICICI-EMPTY-1",
+			"Summary": {"currentBalance": "32500.50", "currency": "INR", "balanceDateTime": "2026-06-01T23:59:59+05:30"},
+			"Transactions": {"startDate": "2026-06-01", "endDate": "2026-06-01", "Transaction": []}
+		}
+	}`
+	emptyFollowUp := `{
+		"fipId": "ICICI-FIP",
+		"institutionName": "ICICI Bank",
+		"Account": {
+			"type": "deposit",
+			"maskedAccNumber": "XXXXXXXX5500",
+			"version": "2.0.0",
+			"linkedAccRef": "ICICI-EMPTY-1",
+			"Summary": {"currentBalance": "33500.50", "currency": "INR", "balanceDateTime": "2026-06-01T10:00:00+05:30"},
+			"Transactions": {
+				"startDate": "2026-06-01",
+				"endDate": "2026-06-01",
+				"Transaction": [{
+					"txnId": "EMPTY-FOLLOW-1",
+					"type": "CREDIT",
+					"mode": "UPI",
+					"amount": "1000.00",
+					"transactionalBalance": "33500.50",
+					"transactionTimestamp": "2026-06-01T01:00:00+05:30",
+					"narration": "UPI/CR/FRIEND"
+				}]
+			}
+		}
+	}`
+
+	// Case 3: Zero starting balance (both empty-txn zero balance and zero-start txn) emits no anchor
+	// on first ingest, and forward ingest still emits no anchor.
+	emptyZeroFirst := `{
+		"fipId": "AXIS-FIP",
+		"institutionName": "Axis Bank",
+		"Account": {
+			"type": "deposit",
+			"maskedAccNumber": "XXXXXXXX8800",
+			"version": "2.0.0",
+			"linkedAccRef": "AXIS-EMPTY-ZERO",
+			"Summary": {"currentBalance": "0.00", "currency": "INR"},
+			"Transactions": {"startDate": "2026-06-01", "Transaction": []}
+		}
+	}`
+	emptyZeroForward := `{
+		"fipId": "AXIS-FIP",
+		"institutionName": "Axis Bank",
+		"Account": {
+			"type": "deposit",
+			"maskedAccNumber": "XXXXXXXX8800",
+			"version": "2.0.0",
+			"linkedAccRef": "AXIS-EMPTY-ZERO",
+			"Summary": {"currentBalance": "1500.00", "currency": "INR"},
+			"Transactions": {
+				"startDate": "2026-06-02",
+				"Transaction": [{
+					"txnId": "AXIS-T1",
+					"type": "CREDIT",
+					"mode": "UPI",
+					"amount": "1500.00",
+					"transactionalBalance": "2500.00",
+					"transactionTimestamp": "2026-06-02T10:00:00+05:30",
+					"narration": "UPI/CR/FIRST"
+				}]
+			}
+		}
+	}`
+	zeroFirst := `{
+		"fipId": "SBI-FIP",
+		"institutionName": "SBI",
+		"Account": {
+			"type": "deposit",
+			"maskedAccNumber": "XXXXXXXX7700",
+			"version": "2.0.0",
+			"linkedAccRef": "SBI-ZERO-1",
+			"Summary": {"currentBalance": "5000.00", "currency": "INR"},
+			"Transactions": {
+				"startDate": "2026-06-01",
+				"endDate": "2026-06-01",
+				"Transaction": [{
+					"txnId": "ZERO-T0",
+					"type": "CREDIT",
+					"mode": "NEFT",
+					"amount": "5000.00",
+					"transactionalBalance": "5000.00",
+					"transactionTimestamp": "2026-06-01T10:00:00+05:30",
+					"narration": "NEFT/INIT"
+				}]
+			}
+		}
+	}`
+	zeroForward := `{
+		"fipId": "SBI-FIP",
+		"institutionName": "SBI",
+		"Account": {
+			"type": "deposit",
+			"maskedAccNumber": "XXXXXXXX7700",
+			"version": "2.0.0",
+			"linkedAccRef": "SBI-ZERO-1",
+			"Summary": {"currentBalance": "6000.00", "currency": "INR"},
+			"Transactions": {
+				"startDate": "2026-06-02",
+				"endDate": "2026-06-05",
+				"Transaction": [{
+					"txnId": "ZERO-T1",
+					"type": "CREDIT",
+					"mode": "NEFT",
+					"amount": "1000.00",
+					"transactionalBalance": "6000.00",
+					"transactionTimestamp": "2026-06-05T10:00:00+05:30",
+					"narration": "NEFT/TOPUP"
+				}]
+			}
+		}
+	}`
+
+	for _, payload := range []string{p1, p2, p3, emptyFirst, emptyFollowUp, emptyZeroFirst, emptyZeroForward, zeroFirst, zeroForward} {
+		enqueueJob(t, ctx, pool, &userID, "AA_DEPOSIT", payload)
+	}
+
+	proc := worker.NewPool(pool, worker.Config{Concurrency: 1})
+	for i := 0; i < 9; i++ {
+		claimed, err := proc.ProcessOne(ctx, "w-anchor")
+		if err != nil || !claimed {
+			t.Fatalf("ProcessOne(%d): claimed=%v err=%v", i, claimed, err)
+		}
+	}
+
+	// Assert Case 1 (HDFC-ANCHOR-1): exactly 1 OPENING_ANCHOR with deterministic key, timestamp = T_0 - 1us, balance = 11000.0000.
+	var anchorCount int
+	var anchorKey string
+	var anchorTS time.Time
+	if err := pool.QueryRow(ctx, `
+		SELECT COUNT(*), MIN(lt.idempotency_key), MIN(lt.txn_timestamp)
+		FROM ledger_transactions lt
+		JOIN accounts a ON a.id = lt.account_id
+		WHERE a.natural_key = 'HDFC-FIP|HDFC-ANCHOR-1' AND lt.txn_type = 'OPENING_ANCHOR'
+	`).Scan(&anchorCount, &anchorKey, &anchorTS); err != nil {
+		t.Fatalf("query HDFC anchor: %v", err)
+	}
+	wantAnchorKey := aa.DepositAnchorIdempotencyKey("HDFC-FIP|HDFC-ANCHOR-1")
+	wantT0, _ := time.Parse(time.RFC3339, "2026-06-05T10:00:00+05:30")
+	if anchorCount != 1 || anchorKey != wantAnchorKey || !anchorTS.Equal(wantT0.Add(-time.Microsecond)) {
+		t.Fatalf("unexpected HDFC anchor: count=%d key=%q wantKey=%q ts=%v wantTS=%v", anchorCount, anchorKey, wantAnchorKey, anchorTS, wantT0.Add(-time.Microsecond))
+	}
+
+	checkBal := func(naturalKey, wantBal string, wantAnchors int) {
+		t.Helper()
+		var bal string
+		var anchors int
+		if err := pool.QueryRow(ctx, `
+			SELECT
+				COALESCE(SUM(le.amount) FILTER (WHERE le.coa_account = 'ASSET:BANK'), 0)::text,
+				(SELECT COUNT(*) FROM ledger_transactions lt WHERE lt.account_id = a.id AND lt.txn_type = 'OPENING_ANCHOR')
+			FROM accounts a
+			LEFT JOIN ledger_entries le ON le.account_id = a.id
+			WHERE a.natural_key = $1
+			GROUP BY a.id
+		`, naturalKey).Scan(&bal, &anchors); err != nil {
+			t.Fatalf("query account %s: %v", naturalKey, err)
+		}
+		if bal != wantBal || anchors != wantAnchors {
+			t.Fatalf("account %s: got bal=%s anchors=%d, want bal=%s anchors=%d", naturalKey, bal, anchors, wantBal, wantAnchors)
+		}
+	}
+
+	checkBal("HDFC-FIP|HDFC-ANCHOR-1", "11000.0000", 1)
+	checkBal("ICICI-FIP|ICICI-EMPTY-1", "33500.5000", 1)
+	checkBal("AXIS-FIP|AXIS-EMPTY-ZERO", "1500.0000", 0)
+	checkBal("SBI-FIP|SBI-ZERO-1", "6000.0000", 0)
+}
+
+// TestWorkerBackfillBeforeAnchorRejectedToDeadLetter verifies that any payload
+// containing a transaction strictly earlier than an account's existing OPENING_ANCHOR
+// transitions immediately to DEAD_LETTER with ERR_BACKFILL_BEFORE_ANCHOR and writes
+// zero Ledger Transactions or Ledger Entries (leaving existing state untouched).
+func TestWorkerBackfillBeforeAnchorRejectedToDeadLetter(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	pool := openWorkerTestPool(t)
+	var userID string
+	if err := pool.QueryRow(ctx,
+		`INSERT INTO users (persona_slug, display_name) VALUES ('aarav', 'Aarav Sharma') RETURNING id::text`,
+	).Scan(&userID); err != nil {
+		t.Fatalf("insert user: %v", err)
+	}
+
+	// Step 1: First ingest establishes OPENING_ANCHOR (+10000) at 2026-06-10T09:59:59.999999+05:30.
+	initial := `{
+		"fipId": "HDFC-FIP",
+		"institutionName": "HDFC Bank",
+		"Account": {
+			"type": "deposit",
+			"maskedAccNumber": "XXXXXXXX4020",
+			"version": "2.0.0",
+			"linkedAccRef": "HDFC-BACKFILL-1",
+			"Summary": {"currentBalance": "9500.00", "currency": "INR", "balanceDateTime": "2026-06-10T10:00:00+05:30"},
+			"Transactions": {
+				"startDate": "2026-06-10",
+				"endDate": "2026-06-10",
+				"Transaction": [{
+					"txnId": "BF-T0",
+					"type": "DEBIT",
+					"mode": "UPI",
+					"amount": "500.00",
+					"transactionalBalance": "9500.00",
+					"transactionTimestamp": "2026-06-10T10:00:00+05:30",
+					"narration": "UPI/DR/INITIAL"
+				}]
+			}
+		}
+	}`
+	enqueueJob(t, ctx, pool, &userID, "AA_DEPOSIT", initial)
+
+	proc := worker.NewPool(pool, worker.Config{Concurrency: 1})
+	if claimed, err := proc.ProcessOne(ctx, "w-bf"); err != nil || !claimed {
+		t.Fatalf("ProcessOne initial: claimed=%v err=%v", claimed, err)
+	}
+
+	// Step 2: Enqueue a backfill payload containing a transaction strictly earlier than
+	// the anchor alongside a newer transaction; the whole batch must fail atomically.
+	backfill := `{
+		"fipId": "HDFC-FIP",
+		"institutionName": "HDFC Bank",
+		"Account": {
+			"type": "deposit",
+			"maskedAccNumber": "XXXXXXXX4020",
+			"version": "2.0.0",
+			"linkedAccRef": "HDFC-BACKFILL-1",
+			"Summary": {"currentBalance": "12500.00", "currency": "INR", "balanceDateTime": "2026-06-11T12:00:00+05:30"},
+			"Transactions": {
+				"startDate": "2026-06-08",
+				"endDate": "2026-06-11",
+				"Transaction": [
+					{
+						"txnId": "BF-OLD",
+						"type": "CREDIT",
+						"mode": "NEFT",
+						"amount": "2000.00",
+						"transactionalBalance": "10000.00",
+						"transactionTimestamp": "2026-06-09T18:00:00+05:30",
+						"narration": "NEFT/OLD"
+					},
+					{
+						"txnId": "BF-NEW",
+						"type": "CREDIT",
+						"mode": "NEFT",
+						"amount": "3000.00",
+						"transactionalBalance": "12500.00",
+						"transactionTimestamp": "2026-06-11T12:00:00+05:30",
+						"narration": "NEFT/NEW"
+					}
+				]
+			}
+		}
+	}`
+	backfillJobID := enqueueJob(t, ctx, pool, &userID, "AA_DEPOSIT", backfill)
+
+	if claimed, err := proc.ProcessOne(ctx, "w-bf"); err != nil || !claimed {
+		t.Fatalf("ProcessOne backfill: claimed=%v err=%v", claimed, err)
+	}
+
+	var status, errCode string
+	var attempts int
+	if err := pool.QueryRow(ctx, `
+		SELECT status::text, COALESCE(last_error_code, ''), attempt_count
+		FROM ingestion_jobs WHERE id = $1
+	`, backfillJobID).Scan(&status, &errCode, &attempts); err != nil {
+		t.Fatalf("query backfill job: %v", err)
+	}
+	if status != "DEAD_LETTER" || errCode != "ERR_BACKFILL_BEFORE_ANCHOR" || attempts != 0 {
+		t.Fatalf("expected immediate DEAD_LETTER/ERR_BACKFILL_BEFORE_ANCHOR/0 attempts, got %s/%s/%d", status, errCode, attempts)
+	}
+
+	// Verify zero Ledger Transactions or Ledger Entries were added and reported_balance was not overwritten.
+	var txnCount int
+	var bankBal, reportedBal string
+	if err := pool.QueryRow(ctx, `
+		SELECT
+			(SELECT COUNT(*) FROM ledger_transactions lt WHERE lt.account_id = a.id),
+			COALESCE(SUM(le.amount) FILTER (WHERE le.coa_account = 'ASSET:BANK'), 0)::text,
+			a.reported_balance::text
+		FROM accounts a
+		LEFT JOIN ledger_entries le ON le.account_id = a.id
+		WHERE a.natural_key = 'HDFC-FIP|HDFC-BACKFILL-1'
+		GROUP BY a.id
+	`).Scan(&txnCount, &bankBal, &reportedBal); err != nil {
+		t.Fatalf("query account after rejected backfill: %v", err)
+	}
+	if txnCount != 2 || bankBal != "9500.0000" || reportedBal != "9500.0000" {
+		t.Fatalf("backfill mutated account state: txns=%d bal=%s reported=%s", txnCount, bankBal, reportedBal)
 	}
 }

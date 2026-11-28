@@ -34,11 +34,16 @@ const (
 	statusCompleted  = "COMPLETED"
 	statusDeadLetter = "DEAD_LETTER"
 
-	errCodeSchemaValidation = "ERR_SCHEMA_VALIDATION"
-	errCodeTransientFault   = "ERR_TRANSIENT_FAULT"
+	errCodeSchemaValidation     = "ERR_SCHEMA_VALIDATION"
+	errCodeBackfillBeforeAnchor = "ERR_BACKFILL_BEFORE_ANCHOR"
+	errCodeTransientFault       = "ERR_TRANSIENT_FAULT"
 )
 
 var (
+	// ErrBackfillBeforeAnchor marks a permanent rejection when an incoming payload
+	// contains a transaction strictly earlier than the account's existing Opening Anchor.
+	ErrBackfillBeforeAnchor = errors.New(errCodeBackfillBeforeAnchor)
+
 	// ErrTransientFault marks a retryable processing fault that triggers exponential
 	// RETRY_WAIT backoff until max_attempts is reached.
 	ErrTransientFault = errors.New(errCodeTransientFault)
@@ -244,6 +249,9 @@ func (p *Pool) ProcessOne(ctx context.Context, workerID string) (bool, error) {
 func (p *Pool) handleProcessingError(ctx context.Context, jobID, workerID string, procErr error) error {
 	if errors.Is(procErr, aa.ErrSchemaValidation) {
 		return p.markDeadLetter(ctx, jobID, workerID, errCodeSchemaValidation, procErr.Error())
+	}
+	if errors.Is(procErr, ErrBackfillBeforeAnchor) {
+		return p.markDeadLetter(ctx, jobID, workerID, errCodeBackfillBeforeAnchor, procErr.Error())
 	}
 	return p.markRetryOrDeadLetter(ctx, jobID, workerID, errCodeTransientFault, procErr.Error())
 }

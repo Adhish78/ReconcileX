@@ -6,10 +6,13 @@ package worker
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/Adhish78/ReconcileX/internal/aa"
+	"github.com/Adhish78/ReconcileX/internal/money"
 	"github.com/jackc/pgx/v5"
 )
 
@@ -18,6 +21,19 @@ const (
 	coaAssetBank        = "ASSET:BANK"
 	coaExternalClearing = "EQUITY:EXTERNAL_CLEARING"
 )
+
+// ledgerPosting represents a normalized zero-sum double-entry posting on
+// ASSET:BANK vs EQUITY:EXTERNAL_CLEARING (either an AA event or OPENING_ANCHOR).
+type ledgerPosting struct {
+	txnType        string
+	txnTimestamp   time.Time
+	valueDate      *time.Time
+	narration      string
+	reference      string
+	idempotencyKey string
+	rawMetadata    []byte
+	signedAmount   money.Decimal4
+}
 
 // postDepositAndComplete atomically resolves the owner, upserts the DEPOSIT
 // Financial Account, posts deduplicated zero-sum Ledger Transactions, and marks
@@ -38,14 +54,75 @@ func (p *Pool) postDepositAndComplete(ctx context.Context, job Job, workerID str
 	}
 
 	// Step 3: Upsert the DEPOSIT Financial Account and refresh its reported balance snapshot.
-	accountID, err := upsertDepositAccount(ctx, tx, userID, parsed)
+	accountID, depositInitialized, err := upsertDepositAccount(ctx, tx, userID, parsed)
 	if err != nil {
 		return err
 	}
 
-	// Step 4: Post each normalized bank event with paired ASSET:BANK and External Clearing legs.
+	// Step 4: Backfill guard — reject any payload containing a transaction strictly earlier
+	// than the account's existing OPENING_ANCHOR timestamp before writing Ledger Transactions or Ledger Entries.
+	var anchorTS time.Time
+	err = tx.QueryRow(ctx, `
+		SELECT txn_timestamp
+		FROM ledger_transactions
+		WHERE account_id = $1 AND txn_type = 'OPENING_ANCHOR'
+		ORDER BY txn_timestamp ASC
+		LIMIT 1
+	`, accountID).Scan(&anchorTS)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return fmt.Errorf("lookup opening anchor timestamp: %w", err)
+	}
+	if err == nil && len(parsed.Transactions) > 0 && parsed.Transactions[0].Timestamp.Before(anchorTS) {
+		return fmt.Errorf("%w: transaction %s (%s) precedes opening anchor (%s)",
+			ErrBackfillBeforeAnchor,
+			parsed.Transactions[0].TxnID,
+			parsed.Transactions[0].Timestamp.UTC().Format(time.RFC3339Nano),
+			anchorTS.UTC().Format(time.RFC3339Nano),
+		)
+	}
+
+	// Step 5: On first ingestion only (neither previously initialized nor holding prior
+	// Ledger Transactions), derive and post an Opening Anchor against External Clearing.
+	if !depositInitialized {
+		var hasExistingTxns bool
+		if err := tx.QueryRow(ctx,
+			`SELECT EXISTS(SELECT 1 FROM ledger_transactions WHERE account_id = $1)`,
+			accountID,
+		).Scan(&hasExistingTxns); err != nil {
+			return fmt.Errorf("check existing ledger transactions: %w", err)
+		}
+		if !hasExistingTxns {
+			if anchor, ok, err := buildDepositOpeningAnchor(parsed); err != nil {
+				return err
+			} else if ok {
+				if err := insertDepositLedgerPosting(ctx, tx, accountID, job.ID, anchor); err != nil {
+					return err
+				}
+			}
+		}
+		if _, err := tx.Exec(ctx, `
+			UPDATE accounts
+			SET metadata = jsonb_set(metadata, '{aa_deposit_initialized}', 'true'::jsonb, true),
+			    updated_at = NOW()
+			WHERE id = $1
+		`, accountID); err != nil {
+			return fmt.Errorf("mark deposit account initialized: %w", err)
+		}
+	}
+
+	// Step 6: Post each normalized bank event with paired ASSET:BANK and External Clearing legs.
 	for _, item := range parsed.Transactions {
-		if err := insertDepositLedgerTransaction(ctx, tx, accountID, job.ID, item); err != nil {
+		posting := ledgerPosting{
+			txnType:        item.TxnType,
+			txnTimestamp:   item.Timestamp,
+			valueDate:      item.ValueDate,
+			narration:      item.Narration,
+			reference:      item.Reference,
+			idempotencyKey: item.IdempotencyKey,
+			rawMetadata:    item.RawMetadata,
+			signedAmount:   item.SignedAmount,
+		}
+		if err := insertDepositLedgerPosting(ctx, tx, accountID, job.ID, posting); err != nil {
 			return err
 		}
 	}
@@ -120,7 +197,7 @@ func resolveDepositCanonicalUser(ctx context.Context, tx pgx.Tx, existing *strin
 // upsertDepositAccount creates or refreshes the Financial Account row keyed by
 // (canonical_user_id, 'DEPOSIT', natural_key), preserving prior non-null metadata
 // and reported balance fields when a subsequent payload omits them.
-func upsertDepositAccount(ctx context.Context, tx pgx.Tx, userID string, parsed aa.DepositPayload) (string, error) {
+func upsertDepositAccount(ctx context.Context, tx pgx.Tx, userID string, parsed aa.DepositPayload) (string, bool, error) {
 	var reportedBalanceStr *string
 	if parsed.ReportedBalance != nil {
 		s := parsed.ReportedBalance.String()
@@ -128,6 +205,7 @@ func upsertDepositAccount(ctx context.Context, tx pgx.Tx, userID string, parsed 
 	}
 
 	var accountID string
+	var initialized bool
 	err := tx.QueryRow(ctx, `
 		INSERT INTO accounts (
 			canonical_user_id, source_type, natural_key, institution_name,
@@ -142,7 +220,7 @@ func upsertDepositAccount(ctx context.Context, tx pgx.Tx, userID string, parsed 
 			reported_balance = COALESCE(EXCLUDED.reported_balance, accounts.reported_balance),
 			reported_balance_at = COALESCE(EXCLUDED.reported_balance_at, accounts.reported_balance_at),
 			updated_at = NOW()
-		RETURNING id::text
+		RETURNING id::text, COALESCE((metadata->>'aa_deposit_initialized')::boolean, false)
 	`,
 		userID,
 		parsed.NaturalKey,
@@ -153,16 +231,16 @@ func upsertDepositAccount(ctx context.Context, tx pgx.Tx, userID string, parsed 
 		parsed.Currency,
 		reportedBalanceStr,
 		parsed.ReportedBalanceAt,
-	).Scan(&accountID)
+	).Scan(&accountID, &initialized)
 	if err != nil {
-		return "", fmt.Errorf("upsert deposit account: %w", err)
+		return "", false, fmt.Errorf("upsert deposit account: %w", err)
 	}
-	return accountID, nil
+	return accountID, initialized, nil
 }
 
-// insertDepositLedgerTransaction inserts one idempotent Ledger Transaction and its
+// insertDepositLedgerPosting inserts one idempotent Ledger Transaction and its
 // two balancing Ledger Entries (+signed on ASSET:BANK, -signed on EQUITY:EXTERNAL_CLEARING).
-func insertDepositLedgerTransaction(ctx context.Context, tx pgx.Tx, accountID, jobID string, item aa.DepositTransaction) error {
+func insertDepositLedgerPosting(ctx context.Context, tx pgx.Tx, accountID, jobID string, p ledgerPosting) error {
 	// Insert the Ledger Transaction header first; ON CONFLICT skips rows already
 	// posted by an overlapping AA fetch window using (account_id, idempotency_key).
 	var txnUUID string
@@ -178,13 +256,13 @@ func insertDepositLedgerTransaction(ctx context.Context, tx pgx.Tx, accountID, j
 	`,
 		accountID,
 		jobID,
-		item.TxnType,
-		item.Timestamp,
-		item.ValueDate,
-		item.Narration,
-		item.Reference,
-		item.IdempotencyKey,
-		string(item.RawMetadata),
+		p.txnType,
+		p.txnTimestamp,
+		p.valueDate,
+		p.narration,
+		p.reference,
+		p.idempotencyKey,
+		string(p.rawMetadata),
 	).Scan(&txnUUID)
 
 	// pgx.ErrNoRows from RETURNING means DO NOTHING fired, so both double-entry legs
@@ -193,12 +271,12 @@ func insertDepositLedgerTransaction(ctx context.Context, tx pgx.Tx, accountID, j
 		return nil
 	}
 	if err != nil {
-		return fmt.Errorf("insert ledger_transaction (%s): %w", item.TxnID, err)
+		return fmt.Errorf("insert ledger_transaction (%s): %w", p.txnType, err)
 	}
 
 	// Post both balancing legs in one statement: bank delta and negated External Clearing offset.
-	bankAmt := item.SignedAmount.String()
-	clearingAmt := item.SignedAmount.Neg().String()
+	bankAmt := p.signedAmount.String()
+	clearingAmt := p.signedAmount.Neg().String()
 
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO ledger_entries (transaction_id, account_id, coa_account, amount)
@@ -206,8 +284,61 @@ func insertDepositLedgerTransaction(ctx context.Context, tx pgx.Tx, accountID, j
 			($1, $2, $3::coa_account, $5),
 			($1, $2, $4::coa_account, $6)
 	`, txnUUID, accountID, coaAssetBank, coaExternalClearing, bankAmt, clearingAmt); err != nil {
-		return fmt.Errorf("insert ledger_entries (%s): %w", item.TxnID, err)
+		return fmt.Errorf("insert ledger_entries (%s): %w", p.txnType, err)
 	}
 
 	return nil
+}
+
+// buildDepositOpeningAnchor derives a synthetic OPENING_ANCHOR ledgerPosting
+// for a first-time DEPOSIT ingestion when the pre-window balance is non-zero.
+func buildDepositOpeningAnchor(parsed aa.DepositPayload) (ledgerPosting, bool, error) {
+	var anchorAmt money.Decimal4
+	var anchorTS time.Time
+	var derivedFrom string
+
+	if len(parsed.Transactions) > 0 {
+		t0 := parsed.Transactions[0]
+		if t0.TransactionalBalance == nil {
+			return ledgerPosting{}, false, nil
+		}
+		var err error
+		anchorAmt, err = t0.TransactionalBalance.Sub(t0.SignedAmount)
+		if err != nil {
+			return ledgerPosting{}, false, fmt.Errorf("derive opening anchor: %w", err)
+		}
+		if anchorAmt == 0 {
+			return ledgerPosting{}, false, nil
+		}
+		anchorTS = t0.Timestamp.Add(-time.Microsecond)
+		derivedFrom = "transactionalBalance"
+	} else {
+		if parsed.ReportedBalance == nil || *parsed.ReportedBalance == 0 {
+			return ledgerPosting{}, false, nil
+		}
+		anchorAmt = *parsed.ReportedBalance
+		switch {
+		case parsed.TransactionsStartDate != nil:
+			anchorTS = *parsed.TransactionsStartDate
+		case parsed.ReportedBalanceAt != nil:
+			anchorTS = *parsed.ReportedBalanceAt
+		default:
+			anchorTS = time.Unix(0, 0).UTC()
+		}
+		derivedFrom = "summaryCurrentBalance"
+	}
+
+	metaBytes, _ := json.Marshal(map[string]any{
+		"openingAnchor": true,
+		"derivedFrom":   derivedFrom,
+	})
+
+	return ledgerPosting{
+		txnType:        "OPENING_ANCHOR",
+		txnTimestamp:   anchorTS,
+		narration:      "Opening Balance Anchor",
+		idempotencyKey: aa.DepositAnchorIdempotencyKey(parsed.NaturalKey),
+		rawMetadata:    metaBytes,
+		signedAmount:   anchorAmt,
+	}, true, nil
 }
