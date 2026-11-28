@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/Adhish78/ReconcileX/internal/aa"
+	"github.com/Adhish78/ReconcileX/internal/cas"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -35,6 +36,7 @@ const (
 	statusDeadLetter = "DEAD_LETTER"
 
 	errCodeSchemaValidation     = "ERR_SCHEMA_VALIDATION"
+	errCodeUnitChecksum         = "ERR_UNIT_CHECKSUM"
 	errCodeBackfillBeforeAnchor = "ERR_BACKFILL_BEFORE_ANCHOR"
 	errCodeTransientFault       = "ERR_TRANSIENT_FAULT"
 )
@@ -232,6 +234,21 @@ func (p *Pool) ProcessOne(ctx context.Context, workerID string) (bool, error) {
 			return true, p.handleProcessingError(ctx, job.ID, workerID, err)
 		}
 
+	case "CAS":
+		// Parse, validate, and run the pre-ledger Unit Checksum gate before opening any DB writes.
+		parsed, err := cas.Parse(job.Payload)
+		if err != nil {
+			return true, p.handleProcessingError(ctx, job.ID, workerID, err)
+		}
+
+		// Post folio scheme accounts, zero-sum ledger legs, and job completion in one DB transaction.
+		if err := p.postCASAndComplete(ctx, job, workerID, parsed); err != nil {
+			if errors.Is(err, ErrLeaseLost) {
+				return true, err
+			}
+			return true, p.handleProcessingError(ctx, job.ID, workerID, err)
+		}
+
 	default:
 		// Unimplemented or unknown source types fail permanently to DEAD_LETTER so they
 		// do not spin in PENDING.
@@ -247,8 +264,11 @@ func (p *Pool) ProcessOne(ctx context.Context, workerID string) (bool, error) {
 // DEAD_LETTER and treats all other processing errors as transient faults subject
 // to exponential RETRY_WAIT backoff up to max_attempts.
 func (p *Pool) handleProcessingError(ctx context.Context, jobID, workerID string, procErr error) error {
-	if errors.Is(procErr, aa.ErrSchemaValidation) {
+	if errors.Is(procErr, aa.ErrSchemaValidation) || errors.Is(procErr, cas.ErrSchemaValidation) {
 		return p.markDeadLetter(ctx, jobID, workerID, errCodeSchemaValidation, procErr.Error())
+	}
+	if errors.Is(procErr, cas.ErrUnitChecksum) {
+		return p.markDeadLetter(ctx, jobID, workerID, errCodeUnitChecksum, procErr.Error())
 	}
 	if errors.Is(procErr, ErrBackfillBeforeAnchor) {
 		return p.markDeadLetter(ctx, jobID, workerID, errCodeBackfillBeforeAnchor, procErr.Error())

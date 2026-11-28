@@ -48,7 +48,7 @@ func (p *Pool) postDepositAndComplete(ctx context.Context, job Job, workerID str
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	// Step 2: Resolve the Canonical User ID from the job or existing account natural key.
-	userID, err := resolveDepositCanonicalUser(ctx, tx, job.CanonicalUserID, parsed.NaturalKey, parsed.InstitutionName)
+	userID, err := resolveCanonicalUserForAccounts(ctx, tx, job.CanonicalUserID, "DEPOSIT", []string{parsed.NaturalKey}, parsed.InstitutionName+" Account Holder")
 	if err != nil {
 		return err
 	}
@@ -129,21 +129,8 @@ func (p *Pool) postDepositAndComplete(ctx context.Context, job Job, workerID str
 
 	// Step 5: Mark the job COMPLETED and attach the resolved canonical_user_id,
 	// verifying that this worker still holds the PROCESSING lease.
-	tag, err := tx.Exec(ctx, `
-		UPDATE ingestion_jobs
-		SET status = $4,
-		    canonical_user_id = $3,
-		    completed_at = NOW(),
-		    locked_by = NULL,
-		    locked_until = NULL,
-		    updated_at = NOW()
-		WHERE id = $1 AND status = $5 AND locked_by = $2
-	`, job.ID, workerID, userID, statusCompleted, statusProcessing)
-	if err != nil {
-		return fmt.Errorf("complete job %s: %w", job.ID, err)
-	}
-	if tag.RowsAffected() == 0 {
-		return fmt.Errorf("%w: job %s for worker %s", ErrLeaseLost, job.ID, workerID)
+	if err := completeLeasedJob(ctx, tx, job.ID, workerID, userID); err != nil {
+		return err
 	}
 
 	// Step 6: Commit triggers PostgreSQL's DEFERRABLE trg_ledger_entries_balanced check.
@@ -154,44 +141,69 @@ func (p *Pool) postDepositAndComplete(ctx context.Context, job Job, workerID str
 	return nil
 }
 
-// resolveDepositCanonicalUser returns the job's explicit Canonical User when provided;
-// otherwise it reuses the ACTIVE owner of an existing DEPOSIT account matching
-// naturalKey so unlinked re-ingests deduplicate onto the same account instead of
-// spawning duplicate users.
-func resolveDepositCanonicalUser(ctx context.Context, tx pgx.Tx, existing *string, naturalKey, institutionName string) (string, error) {
+// resolveCanonicalUserForAccounts returns the job's explicit Canonical User when provided;
+// otherwise it reuses the ACTIVE owner of an existing Financial Account matching
+// sourceType and any of naturalKeys, or creates a new ACTIVE Canonical User.
+func resolveCanonicalUserForAccounts(
+	ctx context.Context,
+	tx pgx.Tx,
+	existing *string,
+	sourceType string,
+	naturalKeys []string,
+	fallbackDisplayName string,
+) (string, error) {
 	if existing != nil && *existing != "" {
 		return *existing, nil
 	}
 
-	// Look for an existing ACTIVE owner holding this exact DEPOSIT natural_key.
-	var matchedUserID string
-	err := tx.QueryRow(ctx, `
-		SELECT a.canonical_user_id::text
-		FROM accounts a
-		JOIN users u ON u.id = a.canonical_user_id
-		WHERE a.source_type = 'DEPOSIT'
-		  AND a.natural_key = $1
-		  AND u.status = 'ACTIVE'
-		ORDER BY a.created_at ASC
-		LIMIT 1
-	`, naturalKey).Scan(&matchedUserID)
-	if err == nil {
-		return matchedUserID, nil
-	}
-	if !errors.Is(err, pgx.ErrNoRows) {
-		return "", fmt.Errorf("lookup existing deposit owner: %w", err)
+	if len(naturalKeys) > 0 {
+		var matchedUserID string
+		err := tx.QueryRow(ctx, `
+			SELECT a.canonical_user_id::text
+			FROM accounts a
+			JOIN users u ON u.id = a.canonical_user_id
+			WHERE a.source_type = $1::account_source_type
+			  AND a.natural_key = ANY($2)
+			  AND u.status = 'ACTIVE'
+			ORDER BY a.created_at ASC
+			LIMIT 1
+		`, sourceType, naturalKeys).Scan(&matchedUserID)
+		if err == nil {
+			return matchedUserID, nil
+		}
+		if !errors.Is(err, pgx.ErrNoRows) {
+			return "", fmt.Errorf("lookup existing %s owner: %w", sourceType, err)
+		}
 	}
 
-	// First-time unlinked ingest: create a non-persona ACTIVE Canonical User (NULL persona_slug).
 	var userID string
-	displayName := institutionName + " Account Holder"
 	if err := tx.QueryRow(ctx,
 		`INSERT INTO users (persona_slug, display_name, status) VALUES (NULL, $1, 'ACTIVE') RETURNING id::text`,
-		displayName,
+		fallbackDisplayName,
 	).Scan(&userID); err != nil {
 		return "", fmt.Errorf("create canonical user: %w", err)
 	}
 	return userID, nil
+}
+
+func completeLeasedJob(ctx context.Context, tx pgx.Tx, jobID, workerID, userID string) error {
+	tag, err := tx.Exec(ctx, `
+		UPDATE ingestion_jobs
+		SET status = $4,
+		    canonical_user_id = $3,
+		    completed_at = NOW(),
+		    locked_by = NULL,
+		    locked_until = NULL,
+		    updated_at = NOW()
+		WHERE id = $1 AND status = $5 AND locked_by = $2
+	`, jobID, workerID, userID, statusCompleted, statusProcessing)
+	if err != nil {
+		return fmt.Errorf("complete job %s: %w", jobID, err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("%w: job %s for worker %s", ErrLeaseLost, jobID, workerID)
+	}
+	return nil
 }
 
 // upsertDepositAccount creates or refreshes the Financial Account row keyed by
