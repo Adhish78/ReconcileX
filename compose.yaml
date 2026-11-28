@@ -1,0 +1,75 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-reconcilex}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-reconcilex}
+      POSTGRES_DB: ${POSTGRES_DB:-reconcilex}
+    volumes:
+      - reconcilex_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-reconcilex} -d ${POSTGRES_DB:-reconcilex}"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+  reconcilex:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    environment:
+      RECONCILEX_DSN: postgres://${POSTGRES_USER:-reconcilex}:${POSTGRES_PASSWORD:-reconcilex}@postgres:5432/${POSTGRES_DB:-reconcilex}?sslmode=disable
+      RECONCILEX_PORT: "8080"
+      RECONCILEX_AUTO_MIGRATE: "true"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/readyz >/dev/null || exit 1"]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+
+  postgres-test:
+    profiles: ["test"]
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_TEST_USER:-reconcilex}
+      POSTGRES_PASSWORD: ${POSTGRES_TEST_PASSWORD:-reconcilex}
+      POSTGRES_DB: ${POSTGRES_TEST_DB:-reconcilex_test}
+    tmpfs:
+      - /var/lib/postgresql/data:rw,noexec,nosuid,size=256m
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_TEST_USER:-reconcilex} -d ${POSTGRES_TEST_DB:-reconcilex_test}"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+  test-go:
+    profiles: ["test"]
+    image: golang:1.27.4-alpine
+    working_dir: /app
+    volumes:
+      - .:/app
+      - reconcilex_test_gomod:/go/pkg/mod
+    depends_on:
+      postgres-test:
+        condition: service_healthy
+    environment:
+      RECONCILEX_TEST_DSN: postgres://${POSTGRES_TEST_USER:-reconcilex}:${POSTGRES_TEST_PASSWORD:-reconcilex}@postgres-test:5432/${POSTGRES_TEST_DB:-reconcilex_test}?sslmode=disable
+      CGO_ENABLED: "1"
+    command: ["sh", "-c", "apk add --no-cache gcc musl-dev >/dev/null && go test -v -race ./..."]
+
+  test-web:
+    profiles: ["test"]
+    image: node:24-alpine
+    working_dir: /app/web
+    volumes:
+      - ./web:/app/web
+      - reconcilex_test_web_node_modules:/app/web/node_modules
+    command: ["sh", "-c", "npm ci --silent && npm run typecheck && npm test"]
+
+volumes:
+  reconcilex_pgdata:
+  reconcilex_test_gomod:
+  reconcilex_test_web_node_modules:

@@ -1,0 +1,43 @@
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary, built with `go test -c`
+*.test
+
+# Code coverage profiles and other test artifacts
+*.out
+coverage.html
+coverage.txt
+coverage.xml
+*.coverprofile
+profile.cov
+
+# Go workspace file
+go.work
+go.work.sum
+
+# env file
+.env
+
+# IDEs
+.vscode/
+
+# Large datasets and project data
+data/
+
+# Agent workspace files, configurations, and scratch scripts
+.agents/
+skills-lock.json
+.scratch/
+AGENTS.md
+CONTEXT.md
+docs/agents
+
+# Frontend build and dependencies
+web/node_modules/
+web/dist/*
+!web/dist/.gitkeep
