@@ -1,5 +1,5 @@
 # Stage 1: Build React SPA bundle
-FROM node:24-alpine AS web-builder
+FROM node:26-alpine AS web-builder
 WORKDIR /app/web
 COPY web/package.json web/package-lock.json ./
 RUN npm ci
@@ -19,7 +19,7 @@ COPY --from=web-builder /app/web/dist ./web/dist
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -o /out/reconcilex ./cmd/reconcilex
 
 # Stage 3: Minimal runtime image
-FROM alpine:3.23
+FROM alpine:3.24
 RUN adduser -D -u 10001 reconcilex
 USER reconcilex
 WORKDIR /app

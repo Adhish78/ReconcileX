@@ -1,12 +1,12 @@
 services:
   postgres:
-    image: postgres:17-alpine
+    image: postgres:19-alpine
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-reconcilex}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-reconcilex}
       POSTGRES_DB: ${POSTGRES_DB:-reconcilex}
     volumes:
-      - reconcilex_pgdata:/var/lib/postgresql/data
+      - reconcilex_pgdata:/var/lib/postgresql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-reconcilex} -d ${POSTGRES_DB:-reconcilex}"]
       interval: 2s
@@ -32,13 +32,13 @@ services:
 
   postgres-test:
     profiles: ["test"]
-    image: postgres:17-alpine
+    image: postgres:19-alpine
     environment:
       POSTGRES_USER: ${POSTGRES_TEST_USER:-reconcilex}
       POSTGRES_PASSWORD: ${POSTGRES_TEST_PASSWORD:-reconcilex}
       POSTGRES_DB: ${POSTGRES_TEST_DB:-reconcilex_test}
     tmpfs:
-      - /var/lib/postgresql/data:rw,noexec,nosuid,size=256m
+      - /var/lib/postgresql:rw,noexec,nosuid,size=256m
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_TEST_USER:-reconcilex} -d ${POSTGRES_TEST_DB:-reconcilex_test}"]
       interval: 2s
@@ -62,7 +62,7 @@ services:
 
   test-web:
     profiles: ["test"]
-    image: node:24-alpine
+    image: node:26-alpine
     working_dir: /app/web
     volumes:
       - ./web:/app/web
