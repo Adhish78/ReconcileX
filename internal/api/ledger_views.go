@@ -31,9 +31,15 @@ type AccountSummary struct {
 	FipID             string     `json:"fip_id"`
 	LinkedAccRef      string     `json:"linked_acc_ref"`
 	MaskedAccNumber   string     `json:"masked_acc_number"`
+	FolioNumber       string     `json:"folio_number"`
+	ISIN              string     `json:"isin"`
+	SchemeCode        *int       `json:"scheme_code"`
+	SchemeName        string     `json:"scheme_name"`
 	Currency          string     `json:"currency"`
 	LedgerBalance     string     `json:"ledger_balance"`
+	LedgerUnits       *string    `json:"ledger_units"`
 	ReportedBalance   *string    `json:"reported_balance"`
+	ReportedUnits     *string    `json:"reported_units"`
 	ReportedBalanceAt *time.Time `json:"reported_balance_at"`
 	OpenAlertCount    int        `json:"open_alert_count"`
 }
@@ -176,11 +182,23 @@ func (s *server) handleGetAccounts(w http.ResponseWriter, r *http.Request) {
 			COALESCE(a.fip_id, ''),
 			COALESCE(a.linked_acc_ref, ''),
 			COALESCE(a.masked_acc_number, ''),
+			COALESCE(a.folio_number, ''),
+			COALESCE(a.isin, ''),
+			a.scheme_code,
+			COALESCE(a.metadata->>'scheme_name', ''),
 			a.currency,
 			COALESCE(SUM(le.amount) FILTER (
 				WHERE le.coa_account IN ('ASSET:BANK', 'ASSET:MF_COST', 'ASSET:EQUITY_COST', 'LIABILITY:LOAN', 'LIABILITY:CARD')
 			), 0)::NUMERIC(18,4)::text AS ledger_balance,
+			CASE
+				WHEN a.source_type = 'MUTUAL_FUND' THEN
+					COALESCE(SUM(le.units) FILTER (
+						WHERE le.coa_account = 'ASSET:MF_COST'
+					), 0)::NUMERIC(18,6)::text
+				ELSE NULL
+			END AS ledger_units,
 			a.reported_balance::text,
+			a.reported_units::text,
 			a.reported_balance_at
 		FROM accounts a
 		LEFT JOIN ledger_entries le ON le.account_id = a.id
@@ -200,7 +218,8 @@ func (s *server) handleGetAccounts(w http.ResponseWriter, r *http.Request) {
 		if err := rows.Scan(
 			&a.ID, &a.CanonicalUserID, &a.SourceType, &a.NaturalKey,
 			&a.InstitutionName, &a.FipID, &a.LinkedAccRef, &a.MaskedAccNumber,
-			&a.Currency, &a.LedgerBalance, &a.ReportedBalance, &a.ReportedBalanceAt,
+			&a.FolioNumber, &a.ISIN, &a.SchemeCode, &a.SchemeName,
+			&a.Currency, &a.LedgerBalance, &a.LedgerUnits, &a.ReportedBalance, &a.ReportedUnits, &a.ReportedBalanceAt,
 		); err != nil {
 			writeError(w, http.StatusServiceUnavailable, errCodeDBUnavailable, "failed to scan account", map[string]any{"reason": err.Error()})
 			return
