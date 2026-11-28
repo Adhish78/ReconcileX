@@ -90,6 +90,9 @@ export function OverviewView({ persona }: PersonaViewProps) {
   const equityHoldings = accounts
     .filter((a) => a.source_type === "EQUITY")
     .flatMap((acct) => (acct.equity_holdings ?? []).map((holding) => ({ account: acct, holding })));
+  const liabilityAccounts = accounts.filter(
+    (a) => a.source_type === "HOME_LOAN" || a.source_type === "AUTO_LOAN"
+  );
 
   function accountIdentifier(acct: AccountSummary): string {
     if (acct.masked_acc_number || acct.linked_acc_ref) {
@@ -136,6 +139,10 @@ export function OverviewView({ persona }: PersonaViewProps) {
           <div className="metric-box">
             <span className="metric-label">Equities (Cost Basis)</span>
             <span className="metric-value">{formatINR(summary.accounts_summary.equities)}</span>
+          </div>
+          <div className="metric-box">
+            <span className="metric-label">Loans</span>
+            <span className="metric-value">{formatINR(summary.accounts_summary.loans)}</span>
           </div>
           <div className="metric-box">
             <span className="metric-label">Total Liabilities</span>
@@ -275,6 +282,49 @@ export function OverviewView({ persona }: PersonaViewProps) {
                         type="button"
                         className="btn-secondary"
                         onClick={() => void handleInspectTransactions(acct.id)}
+                      >
+                        Inspect Transactions
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
+      {/* Liability Accounts table highlighting Outstanding Balances subtracted from Net Worth */}
+      {persona && liabilityAccounts.length > 0 && (
+        <div className="section-gap">
+          <h3>Liability Accounts</h3>
+          <div className="table-wrap">
+            <table className="data-table">
+              <thead>
+                <tr>
+                  <th>Institution</th>
+                  <th>Type</th>
+                  <th>Account</th>
+                  <th>Outstanding Balance</th>
+                  <th>Reported Balance</th>
+                  <th>Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {liabilityAccounts.map((liab) => (
+                  <tr key={liab.id} className={liab.id === selectedAccountId ? "is-selected" : ""}>
+                    <td>{liab.institution_name}</td>
+                    <td>{liab.source_type}</td>
+                    <td className="mono">{accountIdentifier(liab)}</td>
+                    <td className="mono">{formatINR(liab.ledger_balance)}</td>
+                    <td className="mono">
+                      {liab.reported_balance ? formatINR(liab.reported_balance) : "—"}
+                    </td>
+                    <td>
+                      <button
+                        type="button"
+                        className="btn-secondary"
+                        onClick={() => void handleInspectTransactions(liab.id)}
                       >
                         Inspect Transactions
                       </button>

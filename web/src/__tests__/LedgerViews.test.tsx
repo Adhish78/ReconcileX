@@ -944,4 +944,132 @@ describe("Overview Accounts, Transaction Drilldown, and Workbench Jobs", () => {
       expect(root.textContent).toContain("20.0000 units");
     });
   });
+
+  it("displays Liability Accounts, Net Worth subtraction, and split EMI_REPAYMENT drilldown on Overview", async () => {
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = typeof input === "string" ? input : input.toString();
+
+      if (url === "/api/v1/personas") {
+        return jsonResponse({
+          personas: [
+            { id: "u1", persona_slug: "aarav", display_name: "Aarav Sharma", linked_identity_count: 2 }
+          ]
+        });
+      }
+      if (url === "/api/v1/portfolio/summary?persona=aarav") {
+        return jsonResponse({
+          persona: { id: "u1", persona_slug: "aarav", display_name: "Aarav Sharma" },
+          as_of: "2026-06-15T14:20:10Z",
+          net_worth: "150000.0000",
+          total_assets: "1000000.0000",
+          total_liabilities: "850000.0000",
+          portfolio_xirr: null,
+          accounts_summary: {
+            bank_deposits: "1000000.0000",
+            mutual_funds: "0.0000",
+            equities: "0.0000",
+            loans: "850000.0000",
+            credit_cards: "0.0000"
+          },
+          open_alert_count: 0,
+          uncategorized_count: 0,
+          dlq_job_count: 0
+        });
+      }
+      if (url === "/api/v1/accounts?persona=aarav") {
+        return jsonResponse({
+          accounts: [
+            {
+              id: "loan-1",
+              canonical_user_id: "u1",
+              source_type: "HOME_LOAN",
+              natural_key: "HDFC-LOAN-FIP|HL-API-8812",
+              institution_name: "HDFC Home Loans",
+              fip_id: "HDFC-LOAN-FIP",
+              linked_acc_ref: "HL-API-8812",
+              masked_acc_number: "HL-XXXX-8812",
+              currency: "INR",
+              ledger_balance: "600000.0000",
+              reported_balance: "600000.0000",
+              open_alert_count: 0
+            },
+            {
+              id: "loan-2",
+              canonical_user_id: "u1",
+              source_type: "AUTO_LOAN",
+              natural_key: "ICICI-AUTO-FIP|AL-API-3301",
+              institution_name: "ICICI Auto Loans",
+              fip_id: "ICICI-AUTO-FIP",
+              linked_acc_ref: "AL-API-3301",
+              masked_acc_number: "AL-XXXX-3301",
+              currency: "INR",
+              ledger_balance: "250000.0000",
+              reported_balance: "250000.0000",
+              open_alert_count: 0
+            }
+          ]
+        });
+      }
+      if (url.startsWith("/api/v1/accounts/loan-1/transactions")) {
+        return jsonResponse({
+          account_id: "loan-1",
+          total: 1,
+          transactions: [
+            {
+              id: "txn-emi-1",
+              account_id: "loan-1",
+              source: "LIABILITY",
+              txn_type: "EMI_REPAYMENT",
+              category: null,
+              txn_timestamp: "2026-06-05T09:00:00+05:30",
+              narration: "ACH/DR/HDFC HOME LOAN EMI",
+              reference: null,
+              idempotency_key: "k-emi-1",
+              entries: [
+                { id: "el1", coa_account: "LIABILITY:LOAN", amount: "15000.0000", units: null },
+                { id: "el2", coa_account: "EXPENSE:LOAN_INTEREST", amount: "10000.0000", units: null },
+                { id: "el3", coa_account: "EXPENSE:LOAN_FEES", amount: "500.0000", units: null },
+                { id: "el4", coa_account: "EQUITY:EXTERNAL_CLEARING", amount: "-25500.0000", units: null }
+              ]
+            }
+          ]
+        });
+      }
+
+      return jsonResponse({ error: { code: "ERR_NOT_FOUND", message: "not found" } }, 404);
+    });
+
+    handle = await renderIntoDocument(<App />);
+    const root = handle.container;
+
+    await waitForCondition(() => {
+      expect(root.textContent).toContain("Liability Accounts");
+      expect(root.textContent).toContain("1,50,000.00");
+      expect(root.textContent).toContain("8,50,000.00");
+      expect(root.textContent).toContain("HDFC Home Loans");
+      expect(root.textContent).toContain("HOME_LOAN");
+      expect(root.textContent).toContain("HL-XXXX-8812");
+      expect(root.textContent).toContain("6,00,000.00");
+      expect(root.textContent).toContain("ICICI Auto Loans");
+      expect(root.textContent).toContain("AUTO_LOAN");
+      expect(root.textContent).toContain("2,50,000.00");
+    });
+
+    const inspectBtn = Array.from(root.querySelectorAll("button")).find((b) =>
+      b.textContent?.includes("Inspect Transactions")
+    );
+    expect(inspectBtn).toBeDefined();
+
+    await act(async () => {
+      inspectBtn!.click();
+    });
+
+    await waitForCondition(() => {
+      expect(root.textContent).toContain("ACH/DR/HDFC HOME LOAN EMI");
+      expect(root.textContent).toContain("LIABILITY:LOAN");
+      expect(root.textContent).toContain("EXPENSE:LOAN_INTEREST");
+      expect(root.textContent).toContain("EXPENSE:LOAN_FEES");
+      expect(root.textContent).toContain("EQUITY:EXTERNAL_CLEARING");
+    });
+  });
 });
