@@ -20,8 +20,13 @@ profile.cov
 go.work
 go.work.sum
 
-# env file
+# Compiled Go binaries (Windows *.exe above; extensionless Linux/macOS binary at repo root)
+/reconcilex
+
+# Environment files (preserve any committed .env.example template)
 .env
+.env.*
+!.env.example
 
 # IDEs
 .vscode/
@@ -37,7 +42,10 @@ AGENTS.md
 CONTEXT.md
 docs/agents
 
-# Frontend build and dependencies
+# Frontend build, caches, coverage, and TypeScript incremental metadata
 web/node_modules/
 web/dist/*
 !web/dist/.gitkeep
+web/coverage/
+**/.vite/
+*.tsbuildinfo
