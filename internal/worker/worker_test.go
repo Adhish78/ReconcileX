@@ -1,3 +1,6 @@
+// Package worker_test runs PostgreSQL integration tests for the FOR UPDATE SKIP LOCKED
+// worker pool in an isolated `test_worker` schema so concurrent `go test ./...` runs
+// never collide with test_db or test_api.
 package worker_test
 
 import (
@@ -16,6 +19,12 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+// -----------------------------------------------------------------------------
+// Test harness helpers
+// -----------------------------------------------------------------------------
+
+// testDSN resolves the test PostgreSQL DSN from RECONCILEX_TEST_DSN or falls back
+// to the local compose postgres-test container on port 5433.
 func testDSN(t *testing.T) string {
 	t.Helper()
 	if dsn := os.Getenv("RECONCILEX_TEST_DSN"); dsn != "" {
@@ -24,6 +33,8 @@ func testDSN(t *testing.T) string {
 	return "postgres://reconcilex:reconcilex@localhost:5433/reconcilex_test?sslmode=disable"
 }
 
+// openWorkerTestPool resets the dedicated `test_worker` schema and applies all
+// embedded SQL migrations before returning a connection pool scoped to that schema.
 func openWorkerTestPool(t *testing.T) *pgxpool.Pool {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -33,6 +44,8 @@ func openWorkerTestPool(t *testing.T) *pgxpool.Pool {
 	if err != nil {
 		t.Fatalf("parse test dsn: %v", err)
 	}
+
+	// Isolate worker tests from db_test and api_test during parallel package test runs.
 	cfg.ConnConfig.RuntimeParams["search_path"] = "test_worker"
 
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
@@ -51,6 +64,7 @@ func openWorkerTestPool(t *testing.T) *pgxpool.Pool {
 	return pool
 }
 
+// enqueueJob inserts a PENDING ingestion_jobs record with its payload SHA-256 digest.
 func enqueueJob(t *testing.T, ctx context.Context, pool *pgxpool.Pool, userID *string, sourceType, payload string) string {
 	t.Helper()
 	sum := sha256.Sum256([]byte(payload))
@@ -68,6 +82,13 @@ func enqueueJob(t *testing.T, ctx context.Context, pool *pgxpool.Pool, userID *s
 	return jobID
 }
 
+// -----------------------------------------------------------------------------
+// Worker integration tests
+// -----------------------------------------------------------------------------
+
+// TestWorkerPostsDepositDeduplicatesAndRoutesInvalidToDLQ verifies single-worker
+// processing: valid AA_DEPOSIT posting, overlapping transaction deduplication across
+// sequential jobs, zero-sum clearing balance, and DEAD_LETTER routing on schema failure.
 func TestWorkerPostsDepositDeduplicatesAndRoutesInvalidToDLQ(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
@@ -81,6 +102,8 @@ func TestWorkerPostsDepositDeduplicatesAndRoutesInvalidToDLQ(t *testing.T) {
 		t.Fatalf("insert user: %v", err)
 	}
 
+	// Step 1: Enqueue an initial AA_DEPOSIT payload (T-1 +50,000, T-2 -1,500),
+	// an overlapping payload replaying T-2 and adding T-3 (-500), and a malformed payload.
 	validPayload := `{
 		"fipId": "HDFC-FIP",
 		"institutionName": "HDFC Bank",
@@ -118,6 +141,7 @@ func TestWorkerPostsDepositDeduplicatesAndRoutesInvalidToDLQ(t *testing.T) {
 	}`
 
 	job1 := enqueueJob(t, ctx, pool, &userID, "AA_DEPOSIT", validPayload)
+
 	// Second job replays overlapping txn T-2 and adds T-3; T-2 must deduplicate cleanly.
 	overlapPayload := `{
 		"fipId": "HDFC-FIP",
@@ -157,6 +181,7 @@ func TestWorkerPostsDepositDeduplicatesAndRoutesInvalidToDLQ(t *testing.T) {
 	job2 := enqueueJob(t, ctx, pool, &userID, "AA_DEPOSIT", overlapPayload)
 	badJob := enqueueJob(t, ctx, pool, &userID, "AA_DEPOSIT", `{"Account":{"type":"deposit"}}`)
 
+	// Step 2: Drain all 3 queued jobs deterministically via ProcessOne.
 	proc := worker.NewPool(pool, worker.Config{Concurrency: 1, PollInterval: 20 * time.Millisecond})
 	for i := 0; i < 3; i++ {
 		claimed, err := proc.ProcessOne(ctx, "worker-test")
@@ -168,7 +193,7 @@ func TestWorkerPostsDepositDeduplicatesAndRoutesInvalidToDLQ(t *testing.T) {
 		}
 	}
 
-	// Verify job statuses.
+	// Step 3: Verify job1 and job2 finished COMPLETED while badJob routed to DEAD_LETTER.
 	var status1, status2, statusBad, errCode string
 	if err := pool.QueryRow(ctx, `SELECT status::text FROM ingestion_jobs WHERE id = $1`, job1).Scan(&status1); err != nil {
 		t.Fatalf("query job1: %v", err)
@@ -186,7 +211,7 @@ func TestWorkerPostsDepositDeduplicatesAndRoutesInvalidToDLQ(t *testing.T) {
 		t.Fatalf("expected badJob DEAD_LETTER/ERR_SCHEMA_VALIDATION, got %s/%s", statusBad, errCode)
 	}
 
-	// Verify exact bank balance: 50000 - 1500 - 500 = 48000.0000 (T-2 deduplicated), and clearing = -48000.0000.
+	// Step 4: Verify exact bank balance: 50000 - 1500 - 500 = 48000.0000 (T-2 deduplicated), and clearing = -48000.0000.
 	var bankBal, clearingBal string
 	if err := pool.QueryRow(ctx, `
 		SELECT
@@ -203,6 +228,9 @@ func TestWorkerPostsDepositDeduplicatesAndRoutesInvalidToDLQ(t *testing.T) {
 	}
 }
 
+// TestConcurrentSkipLockedWorkersNoDoublePosting races 8 concurrent goroutines
+// against 16 queued jobs for the same Financial Account to verify SKIP LOCKED
+// claim safety and exact balance aggregation without double-posting.
 func TestConcurrentSkipLockedWorkersNoDoublePosting(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
@@ -216,6 +244,7 @@ func TestConcurrentSkipLockedWorkersNoDoublePosting(t *testing.T) {
 		t.Fatalf("insert user: %v", err)
 	}
 
+	// Enqueue 16 distinct 100.00 CREDIT jobs targeting the same ICICI deposit account.
 	const jobCount = 16
 	for i := 0; i < jobCount; i++ {
 		payload := fmt.Sprintf(`{
@@ -263,6 +292,7 @@ func TestConcurrentSkipLockedWorkersNoDoublePosting(t *testing.T) {
 	}
 	wg.Wait()
 
+	// Verify all 16 jobs completed and the bank balance equals exactly 16 * 100 = 1600.0000.
 	var completedCount int
 	var bankBal string
 	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM ingestion_jobs WHERE status = 'COMPLETED'`).Scan(&completedCount); err != nil {
@@ -285,6 +315,9 @@ func TestConcurrentSkipLockedWorkersNoDoublePosting(t *testing.T) {
 	}
 }
 
+// TestWorkerUnlinkedReingestReusesExistingAccountAndDeduplicates ensures two
+// unlinked jobs (canonical_user_id = NULL) sharing the same DEPOSIT natural_key
+// resolve to the same Canonical User and Financial Account without double-posting.
 func TestWorkerUnlinkedReingestReusesExistingAccountAndDeduplicates(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
@@ -315,6 +348,7 @@ func TestWorkerUnlinkedReingestReusesExistingAccountAndDeduplicates(t *testing.T
 	enqueueJob(t, ctx, pool, nil, "AA_DEPOSIT", payload)
 	enqueueJob(t, ctx, pool, nil, "AA_DEPOSIT", payload)
 
+	// Process both unlinked jobs sequentially; the second job must reuse the first user/account.
 	proc := worker.NewPool(pool, worker.Config{Concurrency: 1})
 	for i := 0; i < 2; i++ {
 		if claimed, err := proc.ProcessOne(ctx, "w-unlinked"); err != nil || !claimed {

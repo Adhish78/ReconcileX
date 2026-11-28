@@ -4,8 +4,9 @@
 //   1. Resolve runtime configuration from environment variables and CLI flags.
 //   2. Register OS signal handling (SIGINT/SIGTERM) for graceful shutdown.
 //   3. Connect to PostgreSQL via pgxpool and optionally run embedded SQL migrations.
-//   4. Unwrap the compiled Vite/React UI bundle from web.DistFS().
-//   5. Start the HTTP server (api.NewServer) and drain active requests on exit.
+//   4. Start the SKIP LOCKED ingestion worker pool (worker.NewPool).
+//   5. Unwrap the compiled Vite/React UI bundle from web.DistFS().
+//   6. Start the HTTP server (api.NewServer) and drain HTTP requests + workers on exit.
 package main
 
 import (
@@ -143,7 +144,9 @@ func main() {
 		log.Printf("database migrations verified")
 	}
 
-	// Step 5: Start SKIP LOCKED ingestion workers tied to a cancellable context.
+	// Step 5: Start SKIP LOCKED ingestion workers under a dedicated cancellable context
+	// so shutdown can stop new job claims immediately while letting in-flight HTTP
+	// requests drain before waiting on active worker transactions.
 	workerCtx, cancelWorkers := context.WithCancel(ctx)
 	defer cancelWorkers()
 	workerPool := worker.NewPool(pool, worker.Config{Concurrency: cfg.workerConcurrency})
@@ -173,6 +176,7 @@ func main() {
 	// Step 8: Block until either a shutdown signal arrives or ListenAndServe returns.
 	select {
 	case <-ctx.Done():
+		// Signal workers to stop polling before waiting on HTTP and worker drains.
 		cancelWorkers()
 
 		// Allow in-flight HTTP requests up to 10 seconds to finish cleanly before exit.
@@ -182,6 +186,8 @@ func main() {
 		if err := srv.Shutdown(shutdownCtx); err != nil {
 			log.Printf("graceful shutdown error: %v", err)
 		}
+
+		// Wait for every active worker goroutine to finish its current DB transaction.
 		workerPool.Wait()
 
 	case err := <-errCh:

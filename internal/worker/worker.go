@@ -1,5 +1,9 @@
 // Package worker implements ReconcileX's PostgreSQL FOR UPDATE SKIP LOCKED
 // asynchronous ingestion worker pool.
+//
+// Started by cmd/reconcilex at runtime and invoked synchronously via ProcessOne
+// in integration tests (worker_test.go and server_test.go). Claims PENDING jobs
+// created by POST /api/v1/ingest and routes payloads to source-specific posters.
 package worker
 
 import (
@@ -15,6 +19,8 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+// Default pool tuning, job lifecycle state strings matching PostgreSQL job_status,
+// and dead-letter error codes.
 const (
 	defaultConcurrency  = 4
 	defaultPollInterval = 250 * time.Millisecond
@@ -27,7 +33,11 @@ const (
 	errCodeSchemaValidation = "ERR_SCHEMA_VALIDATION"
 )
 
-// Config configures the SKIP LOCKED worker pool.
+// -----------------------------------------------------------------------------
+// Pool configuration & lifecycle
+// -----------------------------------------------------------------------------
+
+// Config configures worker concurrency and idle queue polling cadence.
 type Config struct {
 	Concurrency  int
 	PollInterval time.Duration
@@ -42,6 +52,7 @@ type Pool struct {
 	wg           sync.WaitGroup
 }
 
+// claimedJob holds the fields returned atomically when a worker leases a job row.
 type claimedJob struct {
 	ID              string
 	CanonicalUserID *string
@@ -49,7 +60,8 @@ type claimedJob struct {
 	Payload         []byte
 }
 
-// NewPool creates a worker pool backed by db.
+// NewPool creates a worker pool backed by db, applying safe defaults for
+// zero or negative Concurrency and PollInterval values.
 func NewPool(db *pgxpool.Pool, cfg Config) *Pool {
 	conc := cfg.Concurrency
 	if conc <= 0 {
@@ -79,11 +91,13 @@ func (p *Pool) Start(ctx context.Context) {
 	}
 }
 
-// Wait blocks until all worker goroutines started by Start have exited.
+// Wait blocks until all worker goroutines started by Start have exited cleanly.
 func (p *Pool) Wait() {
 	p.wg.Wait()
 }
 
+// runLoop continuously drains available jobs without sleeping while the queue has work,
+// backing off for pollInterval only when the queue reports idle.
 func (p *Pool) runLoop(ctx context.Context, workerID string) {
 	for {
 		if ctx.Err() != nil {
@@ -95,10 +109,12 @@ func (p *Pool) runLoop(ctx context.Context, workerID string) {
 			log.Printf("worker %s error: %v", workerID, err)
 		}
 
+		// Immediately attempt another claim when a job was processed to drain bursts quickly.
 		if claimed {
 			continue
 		}
 
+		// Queue was idle: sleep until either pollInterval elapses or shutdown cancels ctx.
 		timer := time.NewTimer(p.pollInterval)
 		select {
 		case <-ctx.Done():
@@ -109,8 +125,13 @@ func (p *Pool) runLoop(ctx context.Context, workerID string) {
 	}
 }
 
-// ProcessOne claims at most one PENDING job via FOR UPDATE SKIP LOCKED, processes it,
-// and updates it to COMPLETED or DEAD_LETTER. Returns (false, nil) when the queue is idle.
+// -----------------------------------------------------------------------------
+// Job claiming & dispatch
+// -----------------------------------------------------------------------------
+
+// ProcessOne claims at most one PENDING job via FOR UPDATE SKIP LOCKED, dispatches it
+// by source_type, and transitions it to COMPLETED or DEAD_LETTER.
+// Returns (false, nil) when no ready job is available in the queue.
 func (p *Pool) ProcessOne(ctx context.Context, workerID string) (bool, error) {
 	job, found, err := p.claimNextJob(ctx, workerID)
 	if err != nil {
@@ -122,8 +143,10 @@ func (p *Pool) ProcessOne(ctx context.Context, workerID string) (bool, error) {
 
 	switch job.SourceType {
 	case "AA_DEPOSIT":
+		// Parse and validate the ReBIT AA payload before opening a ledger write transaction.
 		parsed, err := aa.ParseDeposit(job.Payload)
 		if err != nil {
+			// Permanent schema errors bypass retries and route directly to DEAD_LETTER.
 			if errors.Is(err, aa.ErrSchemaValidation) {
 				if dlqErr := p.markDeadLetter(ctx, job.ID, workerID, errCodeSchemaValidation, err.Error()); dlqErr != nil {
 					return true, dlqErr
@@ -132,10 +155,15 @@ func (p *Pool) ProcessOne(ctx context.Context, workerID string) (bool, error) {
 			}
 			return true, err
 		}
+
+		// Post account upsert, ledger entries, and job completion in one atomic DB transaction.
 		if err := p.postDepositAndComplete(ctx, job, workerID, parsed); err != nil {
 			return true, err
 		}
+
 	default:
+		// Unimplemented or unknown source types fail permanently to DEAD_LETTER so they
+		// do not spin in PENDING.
 		if err := p.markDeadLetter(ctx, job.ID, workerID, errCodeSchemaValidation, fmt.Sprintf("unsupported source_type %q", job.SourceType)); err != nil {
 			return true, err
 		}
@@ -144,6 +172,9 @@ func (p *Pool) ProcessOne(ctx context.Context, workerID string) (bool, error) {
 	return true, nil
 }
 
+// claimNextJob atomically selects one ready PENDING job using FOR UPDATE SKIP LOCKED
+// and flips it to PROCESSING with a 60-second worker lease so concurrent workers
+// never contend on or double-claim the same row.
 func (p *Pool) claimNextJob(ctx context.Context, workerID string) (claimedJob, bool, error) {
 	var job claimedJob
 	err := p.db.QueryRow(ctx, `
@@ -176,6 +207,9 @@ func (p *Pool) claimNextJob(ctx context.Context, workerID string) (claimedJob, b
 	return job, true, nil
 }
 
+// markDeadLetter transitions a leased PROCESSING job to DEAD_LETTER with diagnostic
+// error fields and clears the worker lease. Checking locked_by guards against
+// overwriting a job whose lease was already reclaimed by another worker.
 func (p *Pool) markDeadLetter(ctx context.Context, jobID, workerID, errCode, errMsg string) error {
 	_, err := p.db.Exec(ctx, `
 		UPDATE ingestion_jobs

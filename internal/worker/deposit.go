@@ -1,3 +1,7 @@
+// Deposit ledger poster invoked by worker.Pool.ProcessOne for AA_DEPOSIT jobs.
+// Executes Canonical User resolution, Financial Account upsert, double-entry
+// Ledger Transaction/Entry insertion, and job completion inside one PostgreSQL
+// transaction so deferred zero-sum triggers validate the entire batch at COMMIT.
 package worker
 
 import (
@@ -9,34 +13,45 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
+// Chart of Accounts buckets used for AA DEPOSIT double-entry legs.
 const (
 	coaAssetBank        = "ASSET:BANK"
 	coaExternalClearing = "EQUITY:EXTERNAL_CLEARING"
 )
 
+// postDepositAndComplete atomically resolves the owner, upserts the DEPOSIT
+// Financial Account, posts deduplicated zero-sum Ledger Transactions, and marks
+// the leased job COMPLETED inside one database transaction.
 func (p *Pool) postDepositAndComplete(ctx context.Context, job claimedJob, workerID string, parsed aa.DepositPayload) error {
+	// Step 1: Open a single transaction so account upsert, ledger postings, and job
+	// completion commit together (or roll back cleanly on any trigger/lease failure).
 	tx, err := p.db.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("begin deposit tx: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
+	// Step 2: Resolve the Canonical User ID from the job or existing account natural key.
 	userID, err := resolveDepositCanonicalUser(ctx, tx, job.CanonicalUserID, parsed.NaturalKey, parsed.InstitutionName)
 	if err != nil {
 		return err
 	}
 
+	// Step 3: Upsert the DEPOSIT Financial Account and refresh its reported balance snapshot.
 	accountID, err := upsertDepositAccount(ctx, tx, userID, parsed)
 	if err != nil {
 		return err
 	}
 
+	// Step 4: Post each normalized bank event with paired ASSET:BANK and External Clearing legs.
 	for _, item := range parsed.Transactions {
 		if err := insertDepositLedgerTransaction(ctx, tx, accountID, job.ID, item); err != nil {
 			return err
 		}
 	}
 
+	// Step 5: Mark the job COMPLETED and attach the resolved canonical_user_id,
+	// verifying that this worker still holds the PROCESSING lease.
 	tag, err := tx.Exec(ctx, `
 		UPDATE ingestion_jobs
 		SET status = $4,
@@ -54,6 +69,7 @@ func (p *Pool) postDepositAndComplete(ctx context.Context, job claimedJob, worke
 		return fmt.Errorf("lost lease on job %s for worker %s", job.ID, workerID)
 	}
 
+	// Step 6: Commit triggers PostgreSQL's DEFERRABLE trg_ledger_entries_balanced check.
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit deposit tx for job %s: %w", job.ID, err)
 	}
@@ -61,14 +77,16 @@ func (p *Pool) postDepositAndComplete(ctx context.Context, job claimedJob, worke
 	return nil
 }
 
-// resolveDepositCanonicalUser returns job's explicit Canonical User when provided,
-// otherwise reuses the ACTIVE owner of an existing DEPOSIT account with the same
-// natural_key so unlinked re-ingests deduplicate onto the same account.
+// resolveDepositCanonicalUser returns the job's explicit Canonical User when provided;
+// otherwise it reuses the ACTIVE owner of an existing DEPOSIT account matching
+// naturalKey so unlinked re-ingests deduplicate onto the same account instead of
+// spawning duplicate users.
 func resolveDepositCanonicalUser(ctx context.Context, tx pgx.Tx, existing *string, naturalKey, institutionName string) (string, error) {
 	if existing != nil && *existing != "" {
 		return *existing, nil
 	}
 
+	// Look for an existing ACTIVE owner holding this exact DEPOSIT natural_key.
 	var matchedUserID string
 	err := tx.QueryRow(ctx, `
 		SELECT a.canonical_user_id::text
@@ -87,6 +105,7 @@ func resolveDepositCanonicalUser(ctx context.Context, tx pgx.Tx, existing *strin
 		return "", fmt.Errorf("lookup existing deposit owner: %w", err)
 	}
 
+	// First-time unlinked ingest: create a non-persona ACTIVE Canonical User (NULL persona_slug).
 	var userID string
 	displayName := institutionName + " Account Holder"
 	if err := tx.QueryRow(ctx,
@@ -98,6 +117,9 @@ func resolveDepositCanonicalUser(ctx context.Context, tx pgx.Tx, existing *strin
 	return userID, nil
 }
 
+// upsertDepositAccount creates or refreshes the Financial Account row keyed by
+// (canonical_user_id, 'DEPOSIT', natural_key), preserving prior non-null metadata
+// and reported balance fields when a subsequent payload omits them.
 func upsertDepositAccount(ctx context.Context, tx pgx.Tx, userID string, parsed aa.DepositPayload) (string, error) {
 	var reportedBalanceStr *string
 	if parsed.ReportedBalance != nil {
@@ -138,7 +160,11 @@ func upsertDepositAccount(ctx context.Context, tx pgx.Tx, userID string, parsed 
 	return accountID, nil
 }
 
+// insertDepositLedgerTransaction inserts one idempotent Ledger Transaction and its
+// two balancing Ledger Entries (+signed on ASSET:BANK, -signed on EQUITY:EXTERNAL_CLEARING).
 func insertDepositLedgerTransaction(ctx context.Context, tx pgx.Tx, accountID, jobID string, item aa.DepositTransaction) error {
+	// Insert the Ledger Transaction header first; ON CONFLICT skips rows already
+	// posted by an overlapping AA fetch window using (account_id, idempotency_key).
 	var txnUUID string
 	err := tx.QueryRow(ctx, `
 		INSERT INTO ledger_transactions (
@@ -161,6 +187,8 @@ func insertDepositLedgerTransaction(ctx context.Context, tx pgx.Tx, accountID, j
 		string(item.RawMetadata),
 	).Scan(&txnUUID)
 
+	// pgx.ErrNoRows from RETURNING means DO NOTHING fired, so both double-entry legs
+	// already exist on the ledger and we can return early without duplicating entries.
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil
 	}
@@ -168,6 +196,7 @@ func insertDepositLedgerTransaction(ctx context.Context, tx pgx.Tx, accountID, j
 		return fmt.Errorf("insert ledger_transaction (%s): %w", item.TxnID, err)
 	}
 
+	// Post both balancing legs in one statement: bank delta and negated External Clearing offset.
 	bankAmt := item.SignedAmount.String()
 	clearingAmt := item.SignedAmount.Neg().String()
 
