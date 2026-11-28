@@ -371,3 +371,431 @@ func TestWorkerUnlinkedReingestReusesExistingAccountAndDeduplicates(t *testing.T
 		t.Fatalf("expected 1 user, 1 account, 2500.0000 balance; got users=%d accounts=%d bal=%s", userCount, accountCount, bal)
 	}
 }
+
+// TestWorkerTransientFaultBackoffAndDeadLetter verifies that ErrTransientFault
+// increments attempt_count, schedules RETRY_WAIT with exponential backoff
+// (5s * 2^(attempt_count - 1)), transitions to DEAD_LETTER at max_attempts (3),
+// and recovers cleanly if a retry succeeds before exhaustion.
+func TestWorkerTransientFaultBackoffAndDeadLetter(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	pool := openWorkerTestPool(t)
+
+	var userID string
+	if err := pool.QueryRow(ctx,
+		`INSERT INTO users (persona_slug, display_name) VALUES ('aarav', 'Aarav Sharma') RETURNING id::text`,
+	).Scan(&userID); err != nil {
+		t.Fatalf("insert user: %v", err)
+	}
+
+	makePayload := func(txnID string) string {
+		return fmt.Sprintf(`{
+			"fipId": "HDFC-FIP",
+			"institutionName": "HDFC Bank",
+			"Account": {
+				"type": "deposit",
+				"maskedAccNumber": "XXXXXXXX4020",
+				"version": "2.0.0",
+				"linkedAccRef": "HDFC-4020",
+				"Transactions": {
+					"Transaction": [{
+						"txnId": %q,
+						"type": "CREDIT",
+						"mode": "NEFT",
+						"amount": "1000.00",
+						"transactionTimestamp": "2026-06-15T10:00:00+05:30",
+						"narration": "NEFT CREDIT"
+					}]
+				}
+			}
+		}`, txnID)
+	}
+
+	// Case A: Job exhausts all 3 attempts with ErrTransientFault -> DEAD_LETTER.
+	exhaustJobID := enqueueJob(t, ctx, pool, &userID, "AA_DEPOSIT", makePayload("EXHAUST-1"))
+
+	var attemptsSeen int
+	procFail := worker.NewPool(pool, worker.Config{
+		Concurrency: 1,
+		BeforeProcess: func(context.Context, worker.Job) error {
+			attemptsSeen++
+			return fmt.Errorf("%w: simulated downstream fault #%d", worker.ErrTransientFault, attemptsSeen)
+		},
+	})
+
+	// Failure 1: attempt_count=1, RETRY_WAIT, next_run_at ~5s ahead.
+	if claimed, err := procFail.ProcessOne(ctx, "w-retry"); err != nil || !claimed {
+		t.Fatalf("attempt 1 ProcessOne: claimed=%v err=%v", claimed, err)
+	}
+
+	var status, errCode string
+	var attemptCount int
+	var delaySecs float64
+	var lockedBy *string
+	if err := pool.QueryRow(ctx, `
+		SELECT status::text, attempt_count, COALESCE(last_error_code, ''),
+		       EXTRACT(EPOCH FROM (next_run_at - updated_at)), locked_by
+		FROM ingestion_jobs WHERE id = $1
+	`, exhaustJobID).Scan(&status, &attemptCount, &errCode, &delaySecs, &lockedBy); err != nil {
+		t.Fatalf("query after attempt 1: %v", err)
+	}
+	if status != "RETRY_WAIT" || attemptCount != 1 || errCode != "ERR_TRANSIENT_FAULT" || lockedBy != nil {
+		t.Fatalf("attempt 1 state mismatch: status=%s attempts=%d code=%s lockedBy=%v", status, attemptCount, errCode, lockedBy)
+	}
+	if delaySecs < 4.5 || delaySecs > 6.5 {
+		t.Fatalf("attempt 1 expected ~5s backoff, got %.2fs", delaySecs)
+	}
+
+	// While next_run_at is in the future, ProcessOne must NOT claim the RETRY_WAIT job.
+	if claimed, err := procFail.ProcessOne(ctx, "w-retry"); err != nil || claimed {
+		t.Fatalf("expected RETRY_WAIT before next_run_at not to be claimed: claimed=%v err=%v", claimed, err)
+	}
+
+	// Advance next_run_at and trigger Failure 2: attempt_count=2, RETRY_WAIT, next_run_at ~10s ahead.
+	if _, err := pool.Exec(ctx, `UPDATE ingestion_jobs SET next_run_at = NOW() - INTERVAL '1 second' WHERE id = $1`, exhaustJobID); err != nil {
+		t.Fatalf("advance attempt 2 next_run_at: %v", err)
+	}
+	if claimed, err := procFail.ProcessOne(ctx, "w-retry"); err != nil || !claimed {
+		t.Fatalf("attempt 2 ProcessOne: claimed=%v err=%v", claimed, err)
+	}
+	if err := pool.QueryRow(ctx, `
+		SELECT status::text, attempt_count, EXTRACT(EPOCH FROM (next_run_at - updated_at))
+		FROM ingestion_jobs WHERE id = $1
+	`, exhaustJobID).Scan(&status, &attemptCount, &delaySecs); err != nil {
+		t.Fatalf("query after attempt 2: %v", err)
+	}
+	if status != "RETRY_WAIT" || attemptCount != 2 {
+		t.Fatalf("attempt 2 state mismatch: status=%s attempts=%d", status, attemptCount)
+	}
+	if delaySecs < 9.5 || delaySecs > 11.5 {
+		t.Fatalf("attempt 2 expected ~10s backoff, got %.2fs", delaySecs)
+	}
+
+	// Advance next_run_at and trigger Failure 3: attempt_count=3 >= max_attempts -> DEAD_LETTER.
+	if _, err := pool.Exec(ctx, `UPDATE ingestion_jobs SET next_run_at = NOW() - INTERVAL '1 second' WHERE id = $1`, exhaustJobID); err != nil {
+		t.Fatalf("advance attempt 3 next_run_at: %v", err)
+	}
+	if claimed, err := procFail.ProcessOne(ctx, "w-retry"); err != nil || !claimed {
+		t.Fatalf("attempt 3 ProcessOne: claimed=%v err=%v", claimed, err)
+	}
+	if err := pool.QueryRow(ctx, `
+		SELECT status::text, attempt_count, COALESCE(last_error_code, '')
+		FROM ingestion_jobs WHERE id = $1
+	`, exhaustJobID).Scan(&status, &attemptCount, &errCode); err != nil {
+		t.Fatalf("query after attempt 3: %v", err)
+	}
+	if status != "DEAD_LETTER" || attemptCount != 3 || errCode != "ERR_TRANSIENT_FAULT" {
+		t.Fatalf("attempt 3 expected DEAD_LETTER/3/ERR_TRANSIENT_FAULT, got %s/%d/%s", status, attemptCount, errCode)
+	}
+
+	// Case B: Job fails twice then succeeds on attempt 3 -> COMPLETED with posted ledger balance.
+	recoverJobID := enqueueJob(t, ctx, pool, &userID, "AA_DEPOSIT", makePayload("RECOVER-1"))
+	recoverCalls := 0
+	procRecover := worker.NewPool(pool, worker.Config{
+		Concurrency: 1,
+		BeforeProcess: func(context.Context, worker.Job) error {
+			recoverCalls++
+			if recoverCalls <= 2 {
+				return worker.ErrTransientFault
+			}
+			return nil
+		},
+	})
+
+	for step := 1; step <= 3; step++ {
+		if step > 1 {
+			if _, err := pool.Exec(ctx, `UPDATE ingestion_jobs SET next_run_at = NOW() - INTERVAL '1 second' WHERE id = $1`, recoverJobID); err != nil {
+				t.Fatalf("advance recover job step %d: %v", step, err)
+			}
+		}
+		if claimed, err := procRecover.ProcessOne(ctx, "w-recover"); err != nil || !claimed {
+			t.Fatalf("recover step %d ProcessOne: claimed=%v err=%v", step, claimed, err)
+		}
+	}
+
+	if err := pool.QueryRow(ctx, `SELECT status::text, attempt_count FROM ingestion_jobs WHERE id = $1`, recoverJobID).Scan(&status, &attemptCount); err != nil {
+		t.Fatalf("query recovered job: %v", err)
+	}
+	if status != "COMPLETED" || attemptCount != 2 {
+		t.Fatalf("expected COMPLETED with attempt_count=2, got %s/%d", status, attemptCount)
+	}
+
+	var bankBal string
+	if err := pool.QueryRow(ctx, `SELECT COALESCE(SUM(amount), 0)::text FROM ledger_entries WHERE coa_account = 'ASSET:BANK'`).Scan(&bankBal); err != nil {
+		t.Fatalf("query bank balance: %v", err)
+	}
+	if bankBal != "1000.0000" {
+		t.Fatalf("expected 1000.0000 balance after recovery, got %s", bankBal)
+	}
+}
+
+// TestWorkerLeaseFencingPreventsStaleCompletion verifies that completion updates
+// fence on (id, status = 'PROCESSING', locked_by), rolling back ledger inserts
+// when another worker or sweeper has already taken over the lease.
+func TestWorkerLeaseFencingPreventsStaleCompletion(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	pool := openWorkerTestPool(t)
+
+	var userID string
+	if err := pool.QueryRow(ctx,
+		`INSERT INTO users (persona_slug, display_name) VALUES ('aarav', 'Aarav Sharma') RETURNING id::text`,
+	).Scan(&userID); err != nil {
+		t.Fatalf("insert user: %v", err)
+	}
+
+	payload := `{
+		"fipId": "HDFC-FIP",
+		"institutionName": "HDFC Bank",
+		"Account": {
+			"type": "deposit",
+			"maskedAccNumber": "XXXXXXXX4020",
+			"version": "2.0.0",
+			"linkedAccRef": "HDFC-4020",
+			"Transactions": {
+				"Transaction": [{
+					"txnId": "FENCE-1",
+					"type": "CREDIT",
+					"mode": "NEFT",
+					"amount": "500.00",
+					"transactionTimestamp": "2026-06-15T10:00:00+05:30",
+					"narration": "NEFT CREDIT"
+				}]
+			}
+		}
+	}`
+	jobID := enqueueJob(t, ctx, pool, &userID, "AA_DEPOSIT", payload)
+
+	// Simulate lease loss mid-flight by reassigning locked_by inside BeforeProcess.
+	proc := worker.NewPool(pool, worker.Config{
+		Concurrency: 1,
+		BeforeProcess: func(hookCtx context.Context, job worker.Job) error {
+			// Confirm the worker initially claimed a 60s lease under its own workerID.
+			var lockedBy string
+			var leaseSecs float64
+			if err := pool.QueryRow(hookCtx, `
+				SELECT locked_by, EXTRACT(EPOCH FROM (locked_until - updated_at))
+				FROM ingestion_jobs WHERE id = $1 AND status = 'PROCESSING'
+			`, job.ID).Scan(&lockedBy, &leaseSecs); err != nil {
+				return fmt.Errorf("inspect active lease: %w", err)
+			}
+			if lockedBy != "stale-worker" || leaseSecs < 58 || leaseSecs > 62 {
+				return fmt.Errorf("unexpected lease: locked_by=%q leaseSecs=%.2f", lockedBy, leaseSecs)
+			}
+
+			// Steal the lease to another worker before postDepositAndComplete executes.
+			if _, err := pool.Exec(hookCtx, `UPDATE ingestion_jobs SET locked_by = 'new-owner' WHERE id = $1`, job.ID); err != nil {
+				return err
+			}
+			return nil
+		},
+	})
+
+	claimed, err := proc.ProcessOne(ctx, "stale-worker")
+	if err == nil || !claimed {
+		t.Fatalf("expected fenced lease-loss error on claimed job, got claimed=%v err=%v", claimed, err)
+	}
+
+	// Verify job remains owned by 'new-owner' in PROCESSING and zero ledger rows committed.
+	var status, lockedBy string
+	var txnCount int
+	if err := pool.QueryRow(ctx, `SELECT status::text, locked_by FROM ingestion_jobs WHERE id = $1`, jobID).Scan(&status, &lockedBy); err != nil {
+		t.Fatalf("query job: %v", err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM ledger_transactions`).Scan(&txnCount); err != nil {
+		t.Fatalf("count txns: %v", err)
+	}
+	if status != "PROCESSING" || lockedBy != "new-owner" || txnCount != 0 {
+		t.Fatalf("lease fencing failed: status=%s locked_by=%s txnCount=%d", status, lockedBy, txnCount)
+	}
+}
+
+// TestReclaimStaleLeasesTransitionsExpiredJobs verifies that ReclaimStaleLeases
+// reclaims expired PROCESSING leases using the same retry/dead-letter transitions
+// while leaving active leases untouched.
+func TestReclaimStaleLeasesTransitionsExpiredJobs(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	pool := openWorkerTestPool(t)
+
+	// Job 1: expired lease with attempt_count=0 -> RETRY_WAIT (attempt_count=1, ~5s backoff).
+	jobRetry := enqueueJob(t, ctx, pool, nil, "AA_DEPOSIT", `{}`)
+	// Job 2: expired lease with attempt_count=2 -> DEAD_LETTER (attempt_count=3).
+	jobDLQ := enqueueJob(t, ctx, pool, nil, "AA_DEPOSIT", `{}`)
+	// Job 3: active lease -> stays PROCESSING.
+	jobActive := enqueueJob(t, ctx, pool, nil, "AA_DEPOSIT", `{}`)
+
+	if _, err := pool.Exec(ctx, `
+		UPDATE ingestion_jobs
+		SET status = 'PROCESSING', locked_by = 'dead-worker-1', locked_until = NOW() - INTERVAL '5 seconds', attempt_count = 0
+		WHERE id = $1
+	`, jobRetry); err != nil {
+		t.Fatalf("seed expired retry job: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		UPDATE ingestion_jobs
+		SET status = 'PROCESSING', locked_by = 'dead-worker-2', locked_until = NOW() - INTERVAL '5 seconds', attempt_count = 2
+		WHERE id = $1
+	`, jobDLQ); err != nil {
+		t.Fatalf("seed expired dlq job: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		UPDATE ingestion_jobs
+		SET status = 'PROCESSING', locked_by = 'live-worker', locked_until = NOW() + INTERVAL '30 seconds', attempt_count = 0
+		WHERE id = $1
+	`, jobActive); err != nil {
+		t.Fatalf("seed active job: %v", err)
+	}
+
+	proc := worker.NewPool(pool, worker.Config{Concurrency: 1})
+	reclaimed, err := proc.ReclaimStaleLeases(ctx)
+	if err != nil {
+		t.Fatalf("ReclaimStaleLeases: %v", err)
+	}
+	if reclaimed != 2 {
+		t.Fatalf("expected 2 reclaimed stale leases, got %d", reclaimed)
+	}
+
+	var status, errCode string
+	var attempts int
+	var delaySecs float64
+	var lockedBy *string
+	if err := pool.QueryRow(ctx, `
+		SELECT status::text, attempt_count, COALESCE(last_error_code, ''),
+		       EXTRACT(EPOCH FROM (next_run_at - updated_at)), locked_by
+		FROM ingestion_jobs WHERE id = $1
+	`, jobRetry).Scan(&status, &attempts, &errCode, &delaySecs, &lockedBy); err != nil {
+		t.Fatalf("query jobRetry: %v", err)
+	}
+	if status != "RETRY_WAIT" || attempts != 1 || errCode != "ERR_TRANSIENT_FAULT" || lockedBy != nil || delaySecs < 4.5 || delaySecs > 6.5 {
+		t.Fatalf("unexpected jobRetry state: status=%s attempts=%d code=%s lockedBy=%v delay=%.2fs", status, attempts, errCode, lockedBy, delaySecs)
+	}
+
+	if err := pool.QueryRow(ctx, `
+		SELECT status::text, attempt_count, COALESCE(last_error_code, ''), locked_by
+		FROM ingestion_jobs WHERE id = $1
+	`, jobDLQ).Scan(&status, &attempts, &errCode, &lockedBy); err != nil {
+		t.Fatalf("query jobDLQ: %v", err)
+	}
+	if status != "DEAD_LETTER" || attempts != 3 || errCode != "ERR_TRANSIENT_FAULT" || lockedBy != nil {
+		t.Fatalf("unexpected jobDLQ state: status=%s attempts=%d code=%s lockedBy=%v", status, attempts, errCode, lockedBy)
+	}
+
+	if err := pool.QueryRow(ctx, `
+		SELECT status::text, locked_by FROM ingestion_jobs WHERE id = $1
+	`, jobActive).Scan(&status, &lockedBy); err != nil {
+		t.Fatalf("query jobActive: %v", err)
+	}
+	if status != "PROCESSING" || lockedBy == nil || *lockedBy != "live-worker" {
+		t.Fatalf("active lease was modified: status=%s lockedBy=%v", status, lockedBy)
+	}
+}
+
+// TestConcurrentWorkersAndStaleLeaseSweeperNoDoublePosting races competing workers
+// and the periodic stale-lease sweeper while some job attempts outlive their lease,
+// proving zero double-claims and zero double-posted Ledger Transactions.
+func TestConcurrentWorkersAndStaleLeaseSweeperNoDoublePosting(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	pool := openWorkerTestPool(t)
+
+	var userID string
+	if err := pool.QueryRow(ctx,
+		`INSERT INTO users (persona_slug, display_name) VALUES ('rohan', 'Rohan Verma') RETURNING id::text`,
+	).Scan(&userID); err != nil {
+		t.Fatalf("insert user: %v", err)
+	}
+
+	const jobCount = 10
+	for i := 0; i < jobCount; i++ {
+		payload := fmt.Sprintf(`{
+			"fipId": "SBI-FIP",
+			"institutionName": "SBI",
+			"Account": {
+				"type": "deposit",
+				"maskedAccNumber": "XXXXXXXX3322",
+				"version": "2.0.0",
+				"linkedAccRef": "SBI-3322",
+				"Transactions": {
+					"Transaction": [{
+						"txnId": "SWEEP-TXN-%02d",
+						"type": "CREDIT",
+						"mode": "UPI",
+						"amount": "100.00",
+						"transactionTimestamp": "2026-06-15T10:00:00+05:30",
+						"narration": "UPI/CR/SWEEP-%02d"
+					}]
+				}
+			}
+		}`, i, i)
+		enqueueJob(t, ctx, pool, &userID, "AA_DEPOSIT", payload)
+	}
+
+	// Track first attempt per job safely across concurrent workers so the first
+	// execution stalls past the 40ms lease, forcing the sweeper to reclaim it.
+	var mu sync.Mutex
+	seenFirst := make(map[string]bool)
+
+	runCtx, stopPool := context.WithCancel(ctx)
+	proc := worker.NewPool(pool, worker.Config{
+		Concurrency:      4,
+		PollInterval:     10 * time.Millisecond,
+		LeaseDuration:    40 * time.Millisecond,
+		SweepInterval:    15 * time.Millisecond,
+		BaseRetryBackoff: 10 * time.Millisecond,
+		BeforeProcess: func(hookCtx context.Context, job worker.Job) error {
+			mu.Lock()
+			first := !seenFirst[job.ID]
+			seenFirst[job.ID] = true
+			mu.Unlock()
+			if first {
+				select {
+				case <-time.After(80 * time.Millisecond):
+				case <-hookCtx.Done():
+					return hookCtx.Err()
+				}
+			}
+			return nil
+		},
+	})
+	proc.Start(runCtx)
+
+	// Poll until all 10 jobs settle into COMPLETED.
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		var completed int
+		if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM ingestion_jobs WHERE status = 'COMPLETED'`).Scan(&completed); err != nil {
+			stopPool()
+			proc.Wait()
+			t.Fatalf("count completed: %v", err)
+		}
+		if completed == jobCount {
+			break
+		}
+		if time.Now().After(deadline) {
+			stopPool()
+			proc.Wait()
+			t.Fatalf("timed out waiting for jobs to complete; completed=%d/%d", completed, jobCount)
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+
+	stopPool()
+	proc.Wait()
+
+	var txnCount int
+	var bankBal string
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM ledger_transactions`).Scan(&txnCount); err != nil {
+		t.Fatalf("count ledger txns: %v", err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT COALESCE(SUM(amount), 0)::text FROM ledger_entries WHERE coa_account = 'ASSET:BANK'`).Scan(&bankBal); err != nil {
+		t.Fatalf("sum bank balance: %v", err)
+	}
+	if txnCount != jobCount || bankBal != "1000.0000" {
+		t.Fatalf("expected %d txns and 1000.0000 balance, got txns=%d bal=%s", jobCount, txnCount, bankBal)
+	}
+}

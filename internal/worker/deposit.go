@@ -22,7 +22,7 @@ const (
 // postDepositAndComplete atomically resolves the owner, upserts the DEPOSIT
 // Financial Account, posts deduplicated zero-sum Ledger Transactions, and marks
 // the leased job COMPLETED inside one database transaction.
-func (p *Pool) postDepositAndComplete(ctx context.Context, job claimedJob, workerID string, parsed aa.DepositPayload) error {
+func (p *Pool) postDepositAndComplete(ctx context.Context, job Job, workerID string, parsed aa.DepositPayload) error {
 	// Step 1: Open a single transaction so account upsert, ledger postings, and job
 	// completion commit together (or roll back cleanly on any trigger/lease failure).
 	tx, err := p.db.Begin(ctx)
@@ -66,7 +66,7 @@ func (p *Pool) postDepositAndComplete(ctx context.Context, job claimedJob, worke
 		return fmt.Errorf("complete job %s: %w", job.ID, err)
 	}
 	if tag.RowsAffected() == 0 {
-		return fmt.Errorf("lost lease on job %s for worker %s", job.ID, workerID)
+		return fmt.Errorf("%w: job %s for worker %s", ErrLeaseLost, job.ID, workerID)
 	}
 
 	// Step 6: Commit triggers PostgreSQL's DEFERRABLE trg_ledger_entries_balanced check.

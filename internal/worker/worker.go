@@ -20,48 +20,71 @@ import (
 )
 
 // Default pool tuning, job lifecycle state strings matching PostgreSQL job_status,
-// and dead-letter error codes.
+// and dead-letter / transient error codes.
 const (
-	defaultConcurrency  = 4
-	defaultPollInterval = 250 * time.Millisecond
+	defaultConcurrency      = 4
+	defaultPollInterval     = 250 * time.Millisecond
+	defaultLeaseDuration    = 60 * time.Second
+	defaultSweepInterval    = 10 * time.Second
+	defaultBaseRetryBackoff = 5 * time.Second
 
 	statusPending    = "PENDING"
 	statusProcessing = "PROCESSING"
+	statusRetryWait  = "RETRY_WAIT"
 	statusCompleted  = "COMPLETED"
 	statusDeadLetter = "DEAD_LETTER"
 
 	errCodeSchemaValidation = "ERR_SCHEMA_VALIDATION"
+	errCodeTransientFault   = "ERR_TRANSIENT_FAULT"
+)
+
+var (
+	// ErrTransientFault marks a retryable processing fault that triggers exponential
+	// RETRY_WAIT backoff until max_attempts is reached.
+	ErrTransientFault = errors.New(errCodeTransientFault)
+
+	// ErrLeaseLost indicates that a worker no longer owns the PROCESSING lease
+	// for a job because it expired or was reclaimed by another worker.
+	ErrLeaseLost = errors.New("worker lease lost")
 )
 
 // -----------------------------------------------------------------------------
 // Pool configuration & lifecycle
 // -----------------------------------------------------------------------------
 
-// Config configures worker concurrency and idle queue polling cadence.
-type Config struct {
-	Concurrency  int
-	PollInterval time.Duration
-}
-
-// Pool claims PENDING ingestion_jobs via PostgreSQL FOR UPDATE SKIP LOCKED
-// and dispatches them to source-specific ledger posters.
-type Pool struct {
-	db           *pgxpool.Pool
-	concurrency  int
-	pollInterval time.Duration
-	wg           sync.WaitGroup
-}
-
-// claimedJob holds the fields returned atomically when a worker leases a job row.
-type claimedJob struct {
+// Job holds the fields returned atomically when a worker claims a leased job row.
+type Job struct {
 	ID              string
 	CanonicalUserID *string
 	SourceType      string
 	Payload         []byte
 }
 
+// Config configures worker concurrency, lease/backoff timings, and processing hooks.
+type Config struct {
+	Concurrency      int
+	PollInterval     time.Duration
+	LeaseDuration    time.Duration
+	SweepInterval    time.Duration
+	BaseRetryBackoff time.Duration
+	BeforeProcess    func(ctx context.Context, job Job) error
+}
+
+// Pool claims PENDING and RETRY_WAIT ingestion_jobs via PostgreSQL FOR UPDATE
+// SKIP LOCKED and dispatches them to source-specific ledger posters.
+type Pool struct {
+	db               *pgxpool.Pool
+	concurrency      int
+	pollInterval     time.Duration
+	leaseDuration    time.Duration
+	sweepInterval    time.Duration
+	baseRetryBackoff time.Duration
+	beforeProcess    func(ctx context.Context, job Job) error
+	wg               sync.WaitGroup
+}
+
 // NewPool creates a worker pool backed by db, applying safe defaults for
-// zero or negative Concurrency and PollInterval values.
+// zero or negative configuration durations and concurrency values.
 func NewPool(db *pgxpool.Pool, cfg Config) *Pool {
 	conc := cfg.Concurrency
 	if conc <= 0 {
@@ -71,15 +94,32 @@ func NewPool(db *pgxpool.Pool, cfg Config) *Pool {
 	if poll <= 0 {
 		poll = defaultPollInterval
 	}
+	lease := cfg.LeaseDuration
+	if lease <= 0 {
+		lease = defaultLeaseDuration
+	}
+	sweep := cfg.SweepInterval
+	if sweep <= 0 {
+		sweep = defaultSweepInterval
+	}
+	backoff := cfg.BaseRetryBackoff
+	if backoff <= 0 {
+		backoff = defaultBaseRetryBackoff
+	}
 
 	return &Pool{
-		db:           db,
-		concurrency:  conc,
-		pollInterval: poll,
+		db:               db,
+		concurrency:      conc,
+		pollInterval:     poll,
+		leaseDuration:    lease,
+		sweepInterval:    sweep,
+		baseRetryBackoff: backoff,
+		beforeProcess:    cfg.BeforeProcess,
 	}
 }
 
-// Start launches the configured number of worker goroutines until ctx is cancelled.
+// Start launches the configured number of worker goroutines and the periodic
+// stale-lease sweeper until ctx is cancelled.
 func (p *Pool) Start(ctx context.Context) {
 	for i := 0; i < p.concurrency; i++ {
 		workerID := fmt.Sprintf("worker-%d", i+1)
@@ -88,6 +128,29 @@ func (p *Pool) Start(ctx context.Context) {
 			defer p.wg.Done()
 			p.runLoop(ctx, id)
 		}(workerID)
+	}
+
+	p.wg.Add(1)
+	go func() {
+		defer p.wg.Done()
+		p.runSweeper(ctx)
+	}()
+}
+
+// runSweeper periodically reclaims expired PROCESSING leases on sweepInterval.
+func (p *Pool) runSweeper(ctx context.Context) {
+	ticker := time.NewTicker(p.sweepInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if _, err := p.ReclaimStaleLeases(ctx); err != nil && !errors.Is(err, context.Canceled) {
+				log.Printf("stale lease sweeper error: %v", err)
+			}
+		}
 	}
 }
 
@@ -129,8 +192,9 @@ func (p *Pool) runLoop(ctx context.Context, workerID string) {
 // Job claiming & dispatch
 // -----------------------------------------------------------------------------
 
-// ProcessOne claims at most one PENDING job via FOR UPDATE SKIP LOCKED, dispatches it
-// by source_type, and transitions it to COMPLETED or DEAD_LETTER.
+// ProcessOne claims at most one ready PENDING or RETRY_WAIT job via FOR UPDATE
+// SKIP LOCKED, dispatches it by source_type, and transitions it to COMPLETED,
+// RETRY_WAIT, or DEAD_LETTER.
 // Returns (false, nil) when no ready job is available in the queue.
 func (p *Pool) ProcessOne(ctx context.Context, workerID string) (bool, error) {
 	job, found, err := p.claimNextJob(ctx, workerID)
@@ -141,24 +205,26 @@ func (p *Pool) ProcessOne(ctx context.Context, workerID string) (bool, error) {
 		return false, nil
 	}
 
+	if p.beforeProcess != nil {
+		if err := p.beforeProcess(ctx, job); err != nil {
+			return true, p.handleProcessingError(ctx, job.ID, workerID, err)
+		}
+	}
+
 	switch job.SourceType {
 	case "AA_DEPOSIT":
 		// Parse and validate the ReBIT AA payload before opening a ledger write transaction.
 		parsed, err := aa.ParseDeposit(job.Payload)
 		if err != nil {
-			// Permanent schema errors bypass retries and route directly to DEAD_LETTER.
-			if errors.Is(err, aa.ErrSchemaValidation) {
-				if dlqErr := p.markDeadLetter(ctx, job.ID, workerID, errCodeSchemaValidation, err.Error()); dlqErr != nil {
-					return true, dlqErr
-				}
-				return true, nil
-			}
-			return true, err
+			return true, p.handleProcessingError(ctx, job.ID, workerID, err)
 		}
 
 		// Post account upsert, ledger entries, and job completion in one atomic DB transaction.
 		if err := p.postDepositAndComplete(ctx, job, workerID, parsed); err != nil {
-			return true, err
+			if errors.Is(err, ErrLeaseLost) {
+				return true, err
+			}
+			return true, p.handleProcessingError(ctx, job.ID, workerID, err)
 		}
 
 	default:
@@ -172,46 +238,124 @@ func (p *Pool) ProcessOne(ctx context.Context, workerID string) (bool, error) {
 	return true, nil
 }
 
-// claimNextJob atomically selects one ready PENDING job using FOR UPDATE SKIP LOCKED
-// and flips it to PROCESSING with a 60-second worker lease so concurrent workers
-// never contend on or double-claim the same row.
-func (p *Pool) claimNextJob(ctx context.Context, workerID string) (claimedJob, bool, error) {
-	var job claimedJob
+// handleProcessingError routes permanent schema validation failures straight to
+// DEAD_LETTER and treats all other processing errors as transient faults subject
+// to exponential RETRY_WAIT backoff up to max_attempts.
+func (p *Pool) handleProcessingError(ctx context.Context, jobID, workerID string, procErr error) error {
+	if errors.Is(procErr, aa.ErrSchemaValidation) {
+		return p.markDeadLetter(ctx, jobID, workerID, errCodeSchemaValidation, procErr.Error())
+	}
+	return p.markRetryOrDeadLetter(ctx, jobID, workerID, errCodeTransientFault, procErr.Error())
+}
+
+// claimNextJob atomically selects one ready PENDING or RETRY_WAIT job using
+// FOR UPDATE SKIP LOCKED and flips it to PROCESSING with a fenced worker lease
+// so concurrent workers never contend on or double-claim the same row.
+func (p *Pool) claimNextJob(ctx context.Context, workerID string) (Job, bool, error) {
+	var job Job
 	err := p.db.QueryRow(ctx, `
 		WITH next_job AS (
 			SELECT id
 			FROM ingestion_jobs
-			WHERE status = $2
+			WHERE status IN ($2, $3)
 			  AND next_run_at <= NOW()
 			ORDER BY next_run_at ASC, created_at ASC
 			FOR UPDATE SKIP LOCKED
 			LIMIT 1
 		)
 		UPDATE ingestion_jobs j
-		SET status = $3,
+		SET status = $4,
 		    locked_by = $1,
-		    locked_until = NOW() + INTERVAL '60 seconds',
+		    locked_until = NOW() + ($5::bigint * INTERVAL '1 microsecond'),
 		    updated_at = NOW()
 		FROM next_job
 		WHERE j.id = next_job.id
 		RETURNING j.id::text, j.canonical_user_id::text, j.source_type, j.payload
-	`, workerID, statusPending, statusProcessing).Scan(&job.ID, &job.CanonicalUserID, &job.SourceType, &job.Payload)
+	`, workerID, statusPending, statusRetryWait, statusProcessing, p.leaseDuration.Microseconds()).Scan(
+		&job.ID, &job.CanonicalUserID, &job.SourceType, &job.Payload,
+	)
 
 	if errors.Is(err, pgx.ErrNoRows) {
-		return claimedJob{}, false, nil
+		return Job{}, false, nil
 	}
 	if err != nil {
-		return claimedJob{}, false, fmt.Errorf("claim next job: %w", err)
+		return Job{}, false, fmt.Errorf("claim next job: %w", err)
 	}
 
 	return job, true, nil
 }
 
-// markDeadLetter transitions a leased PROCESSING job to DEAD_LETTER with diagnostic
-// error fields and clears the worker lease. Checking locked_by guards against
-// overwriting a job whose lease was already reclaimed by another worker.
+// retryOrDeadLetterUpdateSQL builds the shared retry-backoff / DEAD_LETTER UPDATE
+// statement parameterized by a target-row CTE (`WHERE` selection) so live worker
+// fault handling and stale-lease reclamation execute identical state transitions.
+func retryOrDeadLetterUpdateSQL(targetCTE string) string {
+	return `
+		WITH target AS (` + targetCTE + `)
+		UPDATE ingestion_jobs j
+		SET attempt_count = j.attempt_count + 1,
+		    status = CASE
+		        WHEN j.attempt_count + 1 >= j.max_attempts THEN $1::job_status
+		        ELSE $2::job_status
+		    END,
+		    next_run_at = CASE
+		        WHEN j.attempt_count + 1 >= j.max_attempts THEN j.next_run_at
+		        ELSE NOW() + ($5::bigint * POWER(2, LEAST(j.attempt_count, 20))::bigint * INTERVAL '1 microsecond')
+		    END,
+		    last_error_code = $3,
+		    last_error_message = $4,
+		    locked_by = NULL,
+		    locked_until = NULL,
+		    updated_at = NOW()
+		FROM target
+		WHERE j.id = target.id`
+}
+
+// markRetryOrDeadLetter increments attempt_count on a leased PROCESSING job and
+// either schedules RETRY_WAIT at baseRetryBackoff * 2^(attempt_count - 1) or
+// moves the job to DEAD_LETTER once attempt_count >= max_attempts.
+func (p *Pool) markRetryOrDeadLetter(ctx context.Context, jobID, workerID, errCode, errMsg string) error {
+	query := retryOrDeadLetterUpdateSQL(`
+		SELECT id FROM ingestion_jobs
+		WHERE id = $6 AND status = $7 AND locked_by = $8
+	`)
+	tag, err := p.db.Exec(ctx, query,
+		statusDeadLetter, statusRetryWait, errCode, errMsg, p.baseRetryBackoff.Microseconds(),
+		jobID, statusProcessing, workerID,
+	)
+	if err != nil {
+		return fmt.Errorf("schedule retry or dead_letter for job %s: %w", jobID, err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("%w: job %s for worker %s", ErrLeaseLost, jobID, workerID)
+	}
+	return nil
+}
+
+// ReclaimStaleLeases sweeps PROCESSING rows whose locked_until lease has expired
+// (locked_until < NOW()) and applies the same retry-backoff or DEAD_LETTER
+// transitions as transient worker faults without disrupting active leases.
+func (p *Pool) ReclaimStaleLeases(ctx context.Context) (int, error) {
+	query := retryOrDeadLetterUpdateSQL(`
+		SELECT id FROM ingestion_jobs
+		WHERE status = $6 AND locked_until < NOW()
+		ORDER BY locked_until ASC
+		FOR UPDATE SKIP LOCKED
+	`)
+	tag, err := p.db.Exec(ctx, query,
+		statusDeadLetter, statusRetryWait, errCodeTransientFault, "worker lease expired before completion", p.baseRetryBackoff.Microseconds(),
+		statusProcessing,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("reclaim stale leases: %w", err)
+	}
+	return int(tag.RowsAffected()), nil
+}
+
+// markDeadLetter transitions a leased PROCESSING job directly to DEAD_LETTER with
+// diagnostic error fields and clears the worker lease. Fencing on (status, locked_by)
+// prevents overwriting a job whose lease was already reclaimed.
 func (p *Pool) markDeadLetter(ctx context.Context, jobID, workerID, errCode, errMsg string) error {
-	_, err := p.db.Exec(ctx, `
+	tag, err := p.db.Exec(ctx, `
 		UPDATE ingestion_jobs
 		SET status = $5,
 		    last_error_code = $3,
@@ -223,6 +367,9 @@ func (p *Pool) markDeadLetter(ctx context.Context, jobID, workerID, errCode, err
 	`, jobID, workerID, errCode, errMsg, statusDeadLetter, statusProcessing)
 	if err != nil {
 		return fmt.Errorf("mark job %s dead_letter: %w", jobID, err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("%w: job %s for worker %s", ErrLeaseLost, jobID, workerID)
 	}
 	return nil
 }
