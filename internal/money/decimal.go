@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"math/big"
 	"strings"
 )
 
@@ -252,6 +253,33 @@ func (d Decimal4) Add(other Decimal4) (Decimal4, error) {
 func (d Decimal4) Sub(other Decimal4) (Decimal4, error) {
 	diff, err := checkedSubInt64(int64(d), int64(other), spec4.typeName)
 	return Decimal4(diff), err
+}
+
+// MulDecimal6 multiplies a Decimal4 price/rate by a Decimal6 quantity and rounds
+// half-away-from-zero back to Decimal4 without IEEE-754 floating-point conversions.
+func (d Decimal4) MulDecimal6(units Decimal6) (Decimal4, error) {
+	prod := new(big.Int).Mul(big.NewInt(int64(d)), big.NewInt(int64(units)))
+	denom := big.NewInt(scale6)
+	quot, rem := new(big.Int).QuoRem(prod, denom, new(big.Int))
+
+	twiceAbsRem := new(big.Int).Lsh(new(big.Int).Abs(rem), 1)
+	if twiceAbsRem.Cmp(denom) >= 0 {
+		if prod.Sign() >= 0 {
+			quot.Add(quot, big.NewInt(1))
+		} else {
+			quot.Sub(quot, big.NewInt(1))
+		}
+	}
+
+	maxRaw := maxInt14*scale4 + (scale4 - 1)
+	if !quot.IsInt64() {
+		return 0, fmt.Errorf("decimal4 multiplication overflow")
+	}
+	v := quot.Int64()
+	if v > maxRaw || v < -maxRaw {
+		return 0, fmt.Errorf("decimal4 multiplication exceeds NUMERIC(18,4)")
+	}
+	return Decimal4(v), nil
 }
 
 // String formats Decimal6 as a fixed-point 6-decimal string (e.g. "33.412000")

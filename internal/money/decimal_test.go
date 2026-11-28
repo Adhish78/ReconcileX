@@ -124,3 +124,35 @@ func TestDecimal6ParseFormatAndArithmetic(t *testing.T) {
 		}
 	}
 }
+
+// TestDecimal4MulDecimal6 verifies exact fixed-point multiplication of a Decimal4
+// price/rate by Decimal6 units with half-up rounding and overflow protection.
+func TestDecimal4MulDecimal6(t *testing.T) {
+	rate, _ := money.ParseDecimal4("2750.00")
+	units, _ := money.ParseDecimal6("30")
+	got, err := rate.MulDecimal6(units)
+	if err != nil {
+		t.Fatalf("MulDecimal6: %v", err)
+	}
+	if got.String() != "82500.0000" {
+		t.Fatalf("2750.00 * 30 = %s, want 82500.0000", got.String())
+	}
+
+	// Half-up rounding on fractional product: 100.1235 * 10.5 = 1051.29675 -> 1051.2968.
+	fracRate, _ := money.ParseDecimal4("100.1235")
+	fracUnits, _ := money.ParseDecimal6("10.5")
+	rounded, err := fracRate.MulDecimal6(fracUnits)
+	if err != nil {
+		t.Fatalf("MulDecimal6 fractional: %v", err)
+	}
+	if rounded.String() != "1051.2968" {
+		t.Fatalf("100.1235 * 10.5 = %s, want 1051.2968", rounded.String())
+	}
+
+	// Overflow guard on huge NUMERIC(18,4) product.
+	hugeRate, _ := money.ParseDecimal4("99999999999999.0000")
+	twoUnits, _ := money.ParseDecimal6("2")
+	if _, err := hugeRate.MulDecimal6(twoUnits); err == nil {
+		t.Fatalf("expected overflow error for product exceeding NUMERIC(18,4)")
+	}
+}
