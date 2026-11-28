@@ -2,7 +2,14 @@
  * Thin REST API client used by the React shell to communicate with the Go backend
  * (either embedded on the same origin in production or proxied by Vite during dev).
  */
-import type { ApiErrorEnvelope, Persona } from "./types";
+import type {
+  AccountSummary,
+  ApiErrorEnvelope,
+  JobSummary,
+  LedgerTransactionItem,
+  Persona,
+  PortfolioSummary
+} from "./types";
 
 /**
  * Converts a non-2xx fetch Response into a readable error message.
@@ -22,19 +29,102 @@ async function parseErrorMessage(res: Response): Promise<string> {
   return `HTTP ${res.status} ${res.statusText}`;
 }
 
+async function fetchJSON<T>(url: string): Promise<T> {
+  const res = await fetch(url);
+  if (!res.ok) {
+    throw new Error(await parseErrorMessage(res));
+  }
+  return (await res.json()) as T;
+}
+
 /**
  * Fetches all ACTIVE Canonical Users that have a persona_slug from GET /api/v1/personas.
  * Throws a descriptive Error (displayed in App's error banner) if the server returns an error.
  */
 export async function fetchPersonas(): Promise<Persona[]> {
-  const res = await fetch("/api/v1/personas");
+  const data = await fetchJSON<{ personas?: Persona[] }>("/api/v1/personas");
+  return data.personas ?? [];
+}
 
-  if (!res.ok) {
-    throw new Error(await parseErrorMessage(res));
+/**
+ * Fetches the persona-scoped portfolio summary (fixed-point decimal strings).
+ * Returns null if the response omits summary fields (e.g., partial test mocks).
+ */
+export async function fetchPortfolioSummary(personaSlug: string): Promise<PortfolioSummary | null> {
+  const data = await fetchJSON<Partial<PortfolioSummary>>(
+    `/api/v1/portfolio/summary?persona=${encodeURIComponent(personaSlug)}`
+  );
+  if (typeof data.net_worth !== "string" || !data.accounts_summary) {
+    return null;
+  }
+  return data as PortfolioSummary;
+}
+
+/** Fetches Financial Accounts scoped to a Persona. */
+export async function fetchAccounts(personaSlug: string): Promise<AccountSummary[]> {
+  const data = await fetchJSON<{ accounts?: AccountSummary[] }>(
+    `/api/v1/accounts?persona=${encodeURIComponent(personaSlug)}`
+  );
+  return data.accounts ?? [];
+}
+
+/** Fetches paginated Ledger Transactions and nested Ledger Entries for one account. */
+export async function fetchAccountTransactions(
+  accountId: string,
+  personaSlug?: string,
+  limit = 50,
+  offset = 0
+): Promise<LedgerTransactionItem[]> {
+  const params = new URLSearchParams({
+    limit: String(limit),
+    offset: String(offset)
+  });
+  if (personaSlug) {
+    params.set("persona", personaSlug);
+  }
+  const data = await fetchJSON<{ transactions?: LedgerTransactionItem[] }>(
+    `/api/v1/accounts/${encodeURIComponent(accountId)}/transactions?${params.toString()}`
+  );
+  return data.transactions ?? [];
+}
+
+/** Fetches ingestion_jobs queue rows, optionally filtered by persona and status. */
+export async function fetchJobs(personaSlug = "", status = ""): Promise<JobSummary[]> {
+  const params = new URLSearchParams();
+  if (personaSlug) {
+    params.set("persona", personaSlug);
+  }
+  if (status) {
+    params.set("status", status);
+  }
+  const qs = params.toString();
+  const data = await fetchJSON<{ jobs?: JobSummary[] }>(`/api/v1/jobs${qs ? `?${qs}` : ""}`);
+  return data.jobs ?? [];
+}
+
+/**
+ * Formats a fixed-point decimal string (e.g. "48500.0000" or "-1500.2500")
+ * using Indian numbering grouping without float conversion on large integers.
+ */
+export function formatINR(decimalStr: string | null | undefined): string {
+  if (!decimalStr) {
+    return "₹0.00";
   }
 
-  const data = (await res.json()) as { personas?: Persona[] };
+  const trimmed = decimalStr.trim();
+  const neg = trimmed.startsWith("-");
+  const unsigned = neg ? trimmed.slice(1) : trimmed;
+  const [intRaw, fracRaw = ""] = unsigned.split(".");
+  const intDigits = intRaw.replace(/^0+(?=\d)/, "") || "0";
 
-  // Normalize missing or null fields to an empty array so callers can map safely.
-  return data.personas ?? [];
+  // Indian numbering system: last 3 digits, then groups of 2.
+  let grouped = intDigits;
+  if (intDigits.length > 3) {
+    const tail = intDigits.slice(-3);
+    const head = intDigits.slice(0, -3).replace(/\B(?=(\d{2})+(?!\d))/g, ",");
+    grouped = `${head},${tail}`;
+  }
+
+  const fracTwo = (fracRaw + "00").slice(0, 2);
+  return `${neg ? "-" : ""}₹${grouped}.${fracTwo}`;
 }
