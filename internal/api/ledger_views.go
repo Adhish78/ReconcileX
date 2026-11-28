@@ -1,0 +1,449 @@
+package api
+
+import (
+	"context"
+	"errors"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/Adhish78/ReconcileX/internal/money"
+	"github.com/jackc/pgx/v5"
+)
+
+// AccountSummary represents a Financial Account with its live ledger balance.
+type AccountSummary struct {
+	ID                string     `json:"id"`
+	CanonicalUserID   string     `json:"canonical_user_id"`
+	SourceType        string     `json:"source_type"`
+	NaturalKey        string     `json:"natural_key"`
+	InstitutionName   string     `json:"institution_name"`
+	FipID             string     `json:"fip_id"`
+	LinkedAccRef      string     `json:"linked_acc_ref"`
+	MaskedAccNumber   string     `json:"masked_acc_number"`
+	Currency          string     `json:"currency"`
+	LedgerBalance     string     `json:"ledger_balance"`
+	ReportedBalance   *string    `json:"reported_balance"`
+	ReportedBalanceAt *time.Time `json:"reported_balance_at"`
+	OpenAlertCount    int        `json:"open_alert_count"`
+}
+
+// LedgerEntryItem represents a single immutable entry leg returned in transaction drilldowns.
+type LedgerEntryItem struct {
+	ID         string  `json:"id"`
+	CoaAccount string  `json:"coa_account"`
+	Amount     string  `json:"amount"`
+	Units      *string `json:"units"`
+}
+
+// LedgerTransactionItem represents a zero-sum Ledger Transaction with nested entries.
+type LedgerTransactionItem struct {
+	ID             string            `json:"id"`
+	AccountID      string            `json:"account_id"`
+	Source         string            `json:"source"`
+	TxnType        string            `json:"txn_type"`
+	Category       *string           `json:"category"`
+	TxnTimestamp   time.Time         `json:"txn_timestamp"`
+	ValueDate      *string           `json:"value_date"`
+	Narration      *string           `json:"narration"`
+	Reference      *string           `json:"reference"`
+	IdempotencyKey string            `json:"idempotency_key"`
+	Entries        []LedgerEntryItem `json:"entries"`
+}
+
+type personaSummary struct {
+	ID          string `json:"id"`
+	PersonaSlug string `json:"persona_slug"`
+	DisplayName string `json:"display_name"`
+}
+
+type accountsListResponse struct {
+	Accounts []AccountSummary `json:"accounts"`
+}
+
+type accountTransactionsResponse struct {
+	AccountID    string                  `json:"account_id"`
+	Transactions []LedgerTransactionItem `json:"transactions"`
+	Total        int                     `json:"total"`
+}
+
+type accountsSummaryBreakdown struct {
+	BankDeposits string `json:"bank_deposits"`
+	MutualFunds  string `json:"mutual_funds"`
+	Equities     string `json:"equities"`
+	Loans        string `json:"loans"`
+	CreditCards  string `json:"credit_cards"`
+}
+
+type portfolioSummaryResponse struct {
+	Persona            personaSummary           `json:"persona"`
+	AsOf               string                   `json:"as_of"`
+	NetWorth           string                   `json:"net_worth"`
+	TotalAssets        string                   `json:"total_assets"`
+	TotalLiabilities   string                   `json:"total_liabilities"`
+	PortfolioXIRR      *float64                 `json:"portfolio_xirr"`
+	AccountsSummary    accountsSummaryBreakdown `json:"accounts_summary"`
+	OpenAlertCount     int                      `json:"open_alert_count"`
+	UncategorizedCount int                      `json:"uncategorized_count"`
+	DLQJobCount        int                      `json:"dlq_job_count"`
+}
+
+func (s *server) requirePool(w http.ResponseWriter) bool {
+	if s.pool == nil {
+		writeError(w, http.StatusServiceUnavailable, errCodeDBUnavailable, "database connection is not initialized", nil)
+		return false
+	}
+	return true
+}
+
+func (s *server) resolvePersonaOrError(ctx context.Context, w http.ResponseWriter, slug string) (personaSummary, bool) {
+	if slug == "" {
+		slug = "aarav"
+	}
+
+	var p personaSummary
+	err := s.pool.QueryRow(ctx, `
+		SELECT id::text, persona_slug, display_name
+		FROM users
+		WHERE persona_slug = $1 AND status = 'ACTIVE'
+	`, slug).Scan(&p.ID, &p.PersonaSlug, &p.DisplayName)
+
+	if errors.Is(err, pgx.ErrNoRows) {
+		writeError(w, http.StatusNotFound, errCodePersonaNotFound, "persona not found", map[string]any{"persona": slug})
+		return personaSummary{}, false
+	}
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, errCodeDBUnavailable, "failed to resolve persona", map[string]any{"reason": err.Error()})
+		return personaSummary{}, false
+	}
+
+	return p, true
+}
+
+func (s *server) handleGetAccounts(w http.ResponseWriter, r *http.Request) {
+	if !s.requirePool(w) {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	persona, ok := s.resolvePersonaOrError(ctx, w, strings.TrimSpace(r.URL.Query().Get("persona")))
+	if !ok {
+		return
+	}
+
+	rows, err := s.pool.Query(ctx, `
+		SELECT
+			a.id::text,
+			a.canonical_user_id::text,
+			a.source_type::text,
+			a.natural_key,
+			a.institution_name,
+			COALESCE(a.fip_id, ''),
+			COALESCE(a.linked_acc_ref, ''),
+			COALESCE(a.masked_acc_number, ''),
+			a.currency,
+			COALESCE(SUM(le.amount) FILTER (
+				WHERE le.coa_account IN ('ASSET:BANK', 'ASSET:MF_COST', 'ASSET:EQUITY_COST', 'LIABILITY:LOAN', 'LIABILITY:CARD')
+			), 0)::NUMERIC(18,4)::text AS ledger_balance,
+			a.reported_balance::text,
+			a.reported_balance_at
+		FROM accounts a
+		LEFT JOIN ledger_entries le ON le.account_id = a.id
+		WHERE a.canonical_user_id = $1
+		GROUP BY a.id
+		ORDER BY a.created_at ASC, a.institution_name ASC
+	`, persona.ID)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, errCodeDBUnavailable, "failed to query accounts", map[string]any{"reason": err.Error()})
+		return
+	}
+	defer rows.Close()
+
+	accounts := make([]AccountSummary, 0)
+	for rows.Next() {
+		var a AccountSummary
+		if err := rows.Scan(
+			&a.ID, &a.CanonicalUserID, &a.SourceType, &a.NaturalKey,
+			&a.InstitutionName, &a.FipID, &a.LinkedAccRef, &a.MaskedAccNumber,
+			&a.Currency, &a.LedgerBalance, &a.ReportedBalance, &a.ReportedBalanceAt,
+		); err != nil {
+			writeError(w, http.StatusServiceUnavailable, errCodeDBUnavailable, "failed to scan account", map[string]any{"reason": err.Error()})
+			return
+		}
+		accounts = append(accounts, a)
+	}
+	if err := rows.Err(); err != nil {
+		writeError(w, http.StatusServiceUnavailable, errCodeDBUnavailable, "failed to iterate accounts", map[string]any{"reason": err.Error()})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, accountsListResponse{Accounts: accounts})
+}
+
+func (s *server) handleGetAccountTransactions(w http.ResponseWriter, r *http.Request) {
+	if !s.requirePool(w) {
+		return
+	}
+
+	accountID := strings.TrimSpace(r.PathValue("id"))
+	if !isValidUUID(accountID) {
+		writeError(w, http.StatusBadRequest, errCodeInvalidRequest, "invalid account id", map[string]any{"id": accountID})
+		return
+	}
+
+	q := r.URL.Query()
+	limit, offset, err := parsePagination(q.Get("limit"), q.Get("offset"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, errCodeInvalidRequest, err.Error(), nil)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	var userFilter string
+	if slug := strings.TrimSpace(q.Get("persona")); slug != "" {
+		persona, ok := s.resolvePersonaOrError(ctx, w, slug)
+		if !ok {
+			return
+		}
+		userFilter = persona.ID
+	}
+
+	var exists bool
+	if err := s.pool.QueryRow(ctx, `
+		SELECT EXISTS(
+			SELECT 1 FROM accounts
+			WHERE id = $1 AND ($2 = '' OR canonical_user_id::text = $2)
+		)
+	`, accountID, userFilter).Scan(&exists); err != nil {
+		writeError(w, http.StatusServiceUnavailable, errCodeDBUnavailable, "failed to check account", map[string]any{"reason": err.Error()})
+		return
+	}
+	if !exists {
+		writeError(w, http.StatusNotFound, errCodeNotFound, "account not found", map[string]any{"id": accountID})
+		return
+	}
+
+	var total int
+	if err := s.pool.QueryRow(ctx, `SELECT COUNT(*)::int FROM ledger_transactions WHERE account_id = $1`, accountID).Scan(&total); err != nil {
+		writeError(w, http.StatusServiceUnavailable, errCodeDBUnavailable, "failed to count transactions", map[string]any{"reason": err.Error()})
+		return
+	}
+
+	rows, err := s.pool.Query(ctx, `
+		SELECT
+			id::text,
+			account_id::text,
+			source,
+			txn_type,
+			category::text,
+			txn_timestamp,
+			value_date::text,
+			narration,
+			reference,
+			idempotency_key
+		FROM ledger_transactions
+		WHERE account_id = $1
+		ORDER BY txn_timestamp DESC, created_at DESC
+		LIMIT $2 OFFSET $3
+	`, accountID, limit, offset)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, errCodeDBUnavailable, "failed to query transactions", map[string]any{"reason": err.Error()})
+		return
+	}
+	defer rows.Close()
+
+	txns := make([]LedgerTransactionItem, 0)
+	txnIDs := make([]string, 0)
+	indexByID := make(map[string]int)
+
+	for rows.Next() {
+		var item LedgerTransactionItem
+		if err := rows.Scan(
+			&item.ID, &item.AccountID, &item.Source, &item.TxnType,
+			&item.Category, &item.TxnTimestamp, &item.ValueDate,
+			&item.Narration, &item.Reference, &item.IdempotencyKey,
+		); err != nil {
+			writeError(w, http.StatusServiceUnavailable, errCodeDBUnavailable, "failed to scan transaction", map[string]any{"reason": err.Error()})
+			return
+		}
+		item.Entries = make([]LedgerEntryItem, 0, 2)
+		indexByID[item.ID] = len(txns)
+		txnIDs = append(txnIDs, item.ID)
+		txns = append(txns, item)
+	}
+	if err := rows.Err(); err != nil {
+		writeError(w, http.StatusServiceUnavailable, errCodeDBUnavailable, "failed to iterate transactions", map[string]any{"reason": err.Error()})
+		return
+	}
+
+	if len(txnIDs) > 0 {
+		entryRows, err := s.pool.Query(ctx, `
+			SELECT
+				id::text,
+				transaction_id::text,
+				coa_account::text,
+				amount::text,
+				units::text
+			FROM ledger_entries
+			WHERE transaction_id = ANY($1::uuid[])
+			ORDER BY created_at ASC, id ASC
+		`, txnIDs)
+		if err != nil {
+			writeError(w, http.StatusServiceUnavailable, errCodeDBUnavailable, "failed to query ledger entries", map[string]any{"reason": err.Error()})
+			return
+		}
+		defer entryRows.Close()
+
+		for entryRows.Next() {
+			var txnID string
+			var entry LedgerEntryItem
+			if err := entryRows.Scan(&entry.ID, &txnID, &entry.CoaAccount, &entry.Amount, &entry.Units); err != nil {
+				writeError(w, http.StatusServiceUnavailable, errCodeDBUnavailable, "failed to scan ledger entry", map[string]any{"reason": err.Error()})
+				return
+			}
+			if idx, ok := indexByID[txnID]; ok {
+				txns[idx].Entries = append(txns[idx].Entries, entry)
+			}
+		}
+		if err := entryRows.Err(); err != nil {
+			writeError(w, http.StatusServiceUnavailable, errCodeDBUnavailable, "failed to iterate ledger entries", map[string]any{"reason": err.Error()})
+			return
+		}
+	}
+
+	writeJSON(w, http.StatusOK, accountTransactionsResponse{
+		AccountID:    accountID,
+		Transactions: txns,
+		Total:        total,
+	})
+}
+
+func (s *server) handleGetPortfolioSummary(w http.ResponseWriter, r *http.Request) {
+	if !s.requirePool(w) {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	persona, ok := s.resolvePersonaOrError(ctx, w, strings.TrimSpace(r.URL.Query().Get("persona")))
+	if !ok {
+		return
+	}
+
+	rows, err := s.pool.Query(ctx, `
+		SELECT
+			a.source_type::text,
+			COALESCE(SUM(le.amount) FILTER (
+				WHERE le.coa_account IN ('ASSET:BANK', 'ASSET:MF_COST', 'ASSET:EQUITY_COST', 'LIABILITY:LOAN', 'LIABILITY:CARD')
+			), 0)::NUMERIC(18,4)::text
+		FROM accounts a
+		LEFT JOIN ledger_entries le ON le.account_id = a.id
+		WHERE a.canonical_user_id = $1
+		GROUP BY a.source_type
+	`, persona.ID)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, errCodeDBUnavailable, "failed to aggregate portfolio balances", map[string]any{"reason": err.Error()})
+		return
+	}
+	defer rows.Close()
+
+	var bankDeposits, mutualFunds, equities, loans, creditCards money.Decimal4
+	for rows.Next() {
+		var srcType, amtStr string
+		if err := rows.Scan(&srcType, &amtStr); err != nil {
+			writeError(w, http.StatusServiceUnavailable, errCodeDBUnavailable, "failed to scan portfolio summary row", map[string]any{"reason": err.Error()})
+			return
+		}
+		amt, parseErr := money.ParseDecimal4(amtStr)
+		if parseErr != nil {
+			writeError(w, http.StatusServiceUnavailable, errCodeDBUnavailable, "invalid decimal from database", map[string]any{"reason": parseErr.Error()})
+			return
+		}
+		switch srcType {
+		case "DEPOSIT":
+			bankDeposits, err = bankDeposits.Add(amt)
+		case "MUTUAL_FUND":
+			mutualFunds, err = mutualFunds.Add(amt)
+		case "EQUITY":
+			equities, err = equities.Add(amt)
+		case "HOME_LOAN", "AUTO_LOAN":
+			loans, err = loans.Add(amt)
+		case "CREDIT_CARD":
+			creditCards, err = creditCards.Add(amt)
+		}
+		if err != nil {
+			writeError(w, http.StatusServiceUnavailable, errCodeDBUnavailable, "decimal arithmetic overflow", map[string]any{"reason": err.Error()})
+			return
+		}
+	}
+	if err := rows.Err(); err != nil {
+		writeError(w, http.StatusServiceUnavailable, errCodeDBUnavailable, "failed to iterate portfolio summary rows", map[string]any{"reason": err.Error()})
+		return
+	}
+
+	totalAssets, err := bankDeposits.Add(mutualFunds)
+	if err == nil {
+		totalAssets, err = totalAssets.Add(equities)
+	}
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, errCodeDBUnavailable, "asset sum overflow", map[string]any{"reason": err.Error()})
+		return
+	}
+
+	totalLiabilities, err := loans.Add(creditCards)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, errCodeDBUnavailable, "liability sum overflow", map[string]any{"reason": err.Error()})
+		return
+	}
+
+	netWorth, err := totalAssets.Sub(totalLiabilities)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, errCodeDBUnavailable, "net worth overflow", map[string]any{"reason": err.Error()})
+		return
+	}
+
+	var dlqCount int
+	if err := s.pool.QueryRow(ctx, `
+		SELECT COUNT(*)::int
+		FROM ingestion_jobs
+		WHERE status = 'DEAD_LETTER' AND canonical_user_id = $1
+	`, persona.ID).Scan(&dlqCount); err != nil {
+		writeError(w, http.StatusServiceUnavailable, errCodeDBUnavailable, "failed to count dlq jobs", map[string]any{"reason": err.Error()})
+		return
+	}
+
+	var uncategorizedCount int
+	if err := s.pool.QueryRow(ctx, `
+		SELECT COUNT(*)::int
+		FROM ledger_transactions lt
+		JOIN accounts a ON a.id = lt.account_id
+		WHERE a.canonical_user_id = $1 AND lt.category = 'UNCATEGORIZED_REVIEW'
+	`, persona.ID).Scan(&uncategorizedCount); err != nil {
+		writeError(w, http.StatusServiceUnavailable, errCodeDBUnavailable, "failed to count uncategorized txns", map[string]any{"reason": err.Error()})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, portfolioSummaryResponse{
+		Persona:          persona,
+		AsOf:             time.Now().UTC().Format(time.RFC3339),
+		NetWorth:         netWorth.String(),
+		TotalAssets:      totalAssets.String(),
+		TotalLiabilities: totalLiabilities.String(),
+		PortfolioXIRR:    nil,
+		AccountsSummary: accountsSummaryBreakdown{
+			BankDeposits: bankDeposits.String(),
+			MutualFunds:  mutualFunds.String(),
+			Equities:     equities.String(),
+			Loans:        loans.String(),
+			CreditCards:  creditCards.String(),
+		},
+		OpenAlertCount:     0,
+		UncategorizedCount: uncategorizedCount,
+		DLQJobCount:        dlqCount,
+	})
+}

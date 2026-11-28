@@ -5,6 +5,7 @@
 package api_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"net/http"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/Adhish78/ReconcileX/internal/api"
 	"github.com/Adhish78/ReconcileX/internal/db"
+	"github.com/Adhish78/ReconcileX/internal/worker"
 	"github.com/Adhish78/ReconcileX/migrations"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -278,5 +280,260 @@ func TestEmbeddedUIAndUnknownAPIRoute(t *testing.T) {
 	srv.ServeHTTP(rec, req)
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("GET /api/v1/unknown expected 404, got %d", rec.Code)
+	}
+}
+
+// TestIngestJobsAccountsTransactionsAndPortfolioSummary exercises the full Issue #14 API flow:
+//   - POST /api/v1/ingest envelope validation (400 ERR_INVALID_REQUEST, 202 Accepted, 200 OK idempotency)
+//   - Worker execution draining the job into COMPLETED (and DLQ for invalid AA payload)
+//   - GET /api/v1/jobs and GET /api/v1/jobs/{id}
+//   - GET /api/v1/accounts?persona=aarav and GET /api/v1/accounts/{id}/transactions
+//   - GET /api/v1/portfolio/summary?persona=aarav with fixed-point decimal strings
+func TestIngestJobsAccountsTransactionsAndPortfolioSummary(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	pool := openTestPool(t, true)
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO users (persona_slug, display_name, status) VALUES ('aarav', 'Aarav Sharma', 'ACTIVE')`,
+	); err != nil {
+		t.Fatalf("insert aarav: %v", err)
+	}
+
+	srv := api.NewServer(pool, migrations.FS, stubWebFS())
+
+	// Case 1: Invalid envelope returns 400 ERR_INVALID_REQUEST.
+	badReq := httptest.NewRequest(http.MethodPost, "/api/v1/ingest", bytes.NewBufferString(`{"source_type":"UNKNOWN","payload":{}}`))
+	badRec := httptest.NewRecorder()
+	srv.ServeHTTP(badRec, badReq)
+	if badRec.Code != http.StatusBadRequest {
+		t.Fatalf("POST /api/v1/ingest invalid envelope expected 400, got %d: %s", badRec.Code, badRec.Body.String())
+	}
+	if code := decodeErrorCode(t, badRec.Body.Bytes()); code != "ERR_INVALID_REQUEST" {
+		t.Fatalf("expected ERR_INVALID_REQUEST, got %q", code)
+	}
+
+	// Case 2: Valid envelope enqueues PENDING job (202 Accepted), and duplicate Idempotency-Key returns 200 OK.
+	ingestBody := `{
+		"source_type": "AA_DEPOSIT",
+		"persona_slug": "aarav",
+		"payload": {
+			"fipId": "HDFC-FIP",
+			"institutionName": "HDFC Bank",
+			"Account": {
+				"type": "deposit",
+				"maskedAccNumber": "XXXXXXXX4020",
+				"version": "2.0.0",
+				"linkedAccRef": "HDFC-4020",
+				"Summary": {
+					"currentBalance": "48500.00",
+					"currency": "INR",
+					"balanceDateTime": "2026-06-15T14:20:10+05:30"
+				},
+				"Transactions": {
+					"Transaction": [
+						{
+							"txnId": "API-TXN-1",
+							"type": "CREDIT",
+							"mode": "NEFT",
+							"amount": "50000.00",
+							"transactionTimestamp": "2026-06-15T09:00:00+05:30",
+							"narration": "NEFT SALARY"
+						},
+						{
+							"txnId": "API-TXN-2",
+							"type": "DEBIT",
+							"mode": "UPI",
+							"amount": "1500.00",
+							"transactionTimestamp": "2026-06-15T14:20:10+05:30",
+							"narration": "UPI/DR/MERCHANT"
+						}
+					]
+				}
+			}
+		}
+	}`
+
+	req1 := httptest.NewRequest(http.MethodPost, "/api/v1/ingest", bytes.NewBufferString(ingestBody))
+	req1.Header.Set("Idempotency-Key", "req-idem-1")
+	rec1 := httptest.NewRecorder()
+	srv.ServeHTTP(rec1, req1)
+	if rec1.Code != http.StatusAccepted {
+		t.Fatalf("POST /api/v1/ingest expected 202, got %d: %s", rec1.Code, rec1.Body.String())
+	}
+
+	var ingestResp struct {
+		JobID          string `json:"job_id"`
+		Status         string `json:"status"`
+		IdempotencyKey string `json:"idempotency_key"`
+	}
+	if err := json.Unmarshal(rec1.Body.Bytes(), &ingestResp); err != nil {
+		t.Fatalf("decode ingest response: %v", err)
+	}
+	if ingestResp.JobID == "" || ingestResp.Status != "PENDING" || ingestResp.IdempotencyKey != "req-idem-1" {
+		t.Fatalf("unexpected ingest response: %+v", ingestResp)
+	}
+
+	// Duplicate request with same Idempotency-Key returns 200 OK with the same job_id.
+	reqDup := httptest.NewRequest(http.MethodPost, "/api/v1/ingest", bytes.NewBufferString(ingestBody))
+	reqDup.Header.Set("Idempotency-Key", "req-idem-1")
+	recDup := httptest.NewRecorder()
+	srv.ServeHTTP(recDup, reqDup)
+	if recDup.Code != http.StatusOK {
+		t.Fatalf("duplicate POST /api/v1/ingest expected 200, got %d: %s", recDup.Code, recDup.Body.String())
+	}
+	var dupResp struct {
+		JobID string `json:"job_id"`
+	}
+	if err := json.Unmarshal(recDup.Body.Bytes(), &dupResp); err != nil || dupResp.JobID != ingestResp.JobID {
+		t.Fatalf("duplicate ingest expected job_id %q, got %s", ingestResp.JobID, recDup.Body.String())
+	}
+
+	// Case 3: Valid JSON envelope with invalid AA schema is accepted asynchronously (202)
+	// and moved to DEAD_LETTER (ERR_SCHEMA_VALIDATION) by the worker.
+	dlqReq := httptest.NewRequest(http.MethodPost, "/api/v1/ingest", bytes.NewBufferString(`{
+		"source_type": "AA_DEPOSIT",
+		"persona_slug": "aarav",
+		"payload": {"Account": {"type": "deposit"}}
+	}`))
+	dlqRec := httptest.NewRecorder()
+	srv.ServeHTTP(dlqRec, dlqReq)
+	if dlqRec.Code != http.StatusAccepted {
+		t.Fatalf("POST /api/v1/ingest async schema failure expected 202, got %d: %s", dlqRec.Code, dlqRec.Body.String())
+	}
+
+	// Drain both jobs using worker pool.
+	proc := worker.NewPool(pool, worker.Config{Concurrency: 1})
+	for i := 0; i < 2; i++ {
+		if claimed, err := proc.ProcessOne(ctx, "api-test-worker"); err != nil || !claimed {
+			t.Fatalf("ProcessOne(%d): claimed=%v err=%v", i, claimed, err)
+		}
+	}
+
+	// Also insert a second user ('priya') with a DEAD_LETTER job to verify persona scoping.
+	var priyaID string
+	if err := pool.QueryRow(ctx,
+		`INSERT INTO users (persona_slug, display_name, status) VALUES ('priya', 'Priya Nair', 'ACTIVE') RETURNING id::text`,
+	).Scan(&priyaID); err != nil {
+		t.Fatalf("insert priya: %v", err)
+	}
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO ingestion_jobs (canonical_user_id, source_type, status, payload, payload_sha256, last_error_code)
+		 VALUES ($1, 'AA_DEPOSIT', 'DEAD_LETTER', '{}'::jsonb, 'priya-dlq', 'ERR_SCHEMA_VALIDATION')`,
+		priyaID,
+	); err != nil {
+		t.Fatalf("insert priya dlq job: %v", err)
+	}
+
+	// Case 4: GET /api/v1/jobs?persona=aarav and GET /api/v1/jobs/{id}?persona=aarav
+	jobsReq := httptest.NewRequest(http.MethodGet, "/api/v1/jobs?persona=aarav", nil)
+	jobsRec := httptest.NewRecorder()
+	srv.ServeHTTP(jobsRec, jobsReq)
+	if jobsRec.Code != http.StatusOK {
+		t.Fatalf("GET /api/v1/jobs expected 200, got %d: %s", jobsRec.Code, jobsRec.Body.String())
+	}
+	var jobsList struct {
+		Jobs []struct {
+			ID            string  `json:"id"`
+			Status        string  `json:"status"`
+			LastErrorCode *string `json:"last_error_code"`
+		} `json:"jobs"`
+	}
+	if err := json.Unmarshal(jobsRec.Body.Bytes(), &jobsList); err != nil {
+		t.Fatalf("decode jobs list: %v", err)
+	}
+	if len(jobsList.Jobs) != 2 {
+		t.Fatalf("expected 2 jobs for aarav, got %d", len(jobsList.Jobs))
+	}
+
+	jobDetailReq := httptest.NewRequest(http.MethodGet, "/api/v1/jobs/"+ingestResp.JobID+"?persona=aarav", nil)
+	jobDetailRec := httptest.NewRecorder()
+	srv.ServeHTTP(jobDetailRec, jobDetailReq)
+	if jobDetailRec.Code != http.StatusOK {
+		t.Fatalf("GET /api/v1/jobs/{id} expected 200, got %d: %s", jobDetailRec.Code, jobDetailRec.Body.String())
+	}
+
+	// Querying aarav's job under priya's persona scope returns 404.
+	wrongPersonaJobReq := httptest.NewRequest(http.MethodGet, "/api/v1/jobs/"+ingestResp.JobID+"?persona=priya", nil)
+	wrongPersonaJobRec := httptest.NewRecorder()
+	srv.ServeHTTP(wrongPersonaJobRec, wrongPersonaJobReq)
+	if wrongPersonaJobRec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for mismatched persona job, got %d", wrongPersonaJobRec.Code)
+	}
+
+	// Case 5: GET /api/v1/accounts?persona=aarav & GET /api/v1/accounts/{id}/transactions?persona=aarav
+	acctsReq := httptest.NewRequest(http.MethodGet, "/api/v1/accounts?persona=aarav", nil)
+	acctsRec := httptest.NewRecorder()
+	srv.ServeHTTP(acctsRec, acctsReq)
+	if acctsRec.Code != http.StatusOK {
+		t.Fatalf("GET /api/v1/accounts expected 200, got %d: %s", acctsRec.Code, acctsRec.Body.String())
+	}
+	var acctsResp struct {
+		Accounts []struct {
+			ID              string  `json:"id"`
+			InstitutionName string  `json:"institution_name"`
+			LedgerBalance   string  `json:"ledger_balance"`
+			ReportedBalance *string `json:"reported_balance"`
+		} `json:"accounts"`
+	}
+	if err := json.Unmarshal(acctsRec.Body.Bytes(), &acctsResp); err != nil {
+		t.Fatalf("decode accounts: %v", err)
+	}
+	if len(acctsResp.Accounts) != 1 || acctsResp.Accounts[0].LedgerBalance != "48500.0000" {
+		t.Fatalf("unexpected accounts response: %+v", acctsResp.Accounts)
+	}
+
+	acctID := acctsResp.Accounts[0].ID
+	txnsReq := httptest.NewRequest(http.MethodGet, "/api/v1/accounts/"+acctID+"/transactions?persona=aarav", nil)
+	txnsRec := httptest.NewRecorder()
+	srv.ServeHTTP(txnsRec, txnsReq)
+	if txnsRec.Code != http.StatusOK {
+		t.Fatalf("GET /api/v1/accounts/{id}/transactions expected 200, got %d: %s", txnsRec.Code, txnsRec.Body.String())
+	}
+
+	// Querying aarav's account transactions under priya's persona scope returns 404.
+	wrongAcctReq := httptest.NewRequest(http.MethodGet, "/api/v1/accounts/"+acctID+"/transactions?persona=priya", nil)
+	wrongAcctRec := httptest.NewRecorder()
+	srv.ServeHTTP(wrongAcctRec, wrongAcctReq)
+	if wrongAcctRec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for mismatched persona account transactions, got %d", wrongAcctRec.Code)
+	}
+	var txnsResp struct {
+		Transactions []struct {
+			ID      string `json:"id"`
+			TxnType string `json:"txn_type"`
+			Entries []struct {
+				CoaAccount string `json:"coa_account"`
+				Amount     string `json:"amount"`
+			} `json:"entries"`
+		} `json:"transactions"`
+	}
+	if err := json.Unmarshal(txnsRec.Body.Bytes(), &txnsResp); err != nil {
+		t.Fatalf("decode transactions: %v", err)
+	}
+	if len(txnsResp.Transactions) != 2 || len(txnsResp.Transactions[0].Entries) != 2 {
+		t.Fatalf("unexpected transactions response: %+v", txnsResp.Transactions)
+	}
+
+	// Case 6: GET /api/v1/portfolio/summary?persona=aarav
+	sumReq := httptest.NewRequest(http.MethodGet, "/api/v1/portfolio/summary?persona=aarav", nil)
+	sumRec := httptest.NewRecorder()
+	srv.ServeHTTP(sumRec, sumReq)
+	if sumRec.Code != http.StatusOK {
+		t.Fatalf("GET /api/v1/portfolio/summary expected 200, got %d: %s", sumRec.Code, sumRec.Body.String())
+	}
+	var sumResp struct {
+		NetWorth        string `json:"net_worth"`
+		TotalAssets     string `json:"total_assets"`
+		DLQJobCount     int    `json:"dlq_job_count"`
+		AccountsSummary struct {
+			BankDeposits string `json:"bank_deposits"`
+		} `json:"accounts_summary"`
+	}
+	if err := json.Unmarshal(sumRec.Body.Bytes(), &sumResp); err != nil {
+		t.Fatalf("decode portfolio summary: %v", err)
+	}
+	if sumResp.NetWorth != "48500.0000" || sumResp.TotalAssets != "48500.0000" || sumResp.AccountsSummary.BankDeposits != "48500.0000" || sumResp.DLQJobCount != 1 {
+		t.Fatalf("unexpected portfolio summary: %+v", sumResp)
 	}
 }

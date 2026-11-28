@@ -30,6 +30,7 @@ const (
 	errCodeDBUnavailable   = "ERR_DB_UNAVAILABLE"
 	errCodePersonaNotFound = "ERR_PERSONA_NOT_FOUND"
 	errCodeNotFound        = "ERR_NOT_FOUND"
+	errCodeInvalidRequest  = "ERR_INVALID_REQUEST"
 )
 
 // Persona represents an ACTIVE Canonical User returned by GET /api/v1/personas,
@@ -82,6 +83,12 @@ func NewServer(pool *pgxpool.Pool, migrationsFS fs.FS, webFS fs.FS) http.Handler
 
 	// Versioned REST API endpoints.
 	mux.HandleFunc("GET /api/v1/personas", s.handleGetPersonas)
+	mux.HandleFunc("POST /api/v1/ingest", s.handlePostIngest)
+	mux.HandleFunc("GET /api/v1/jobs", s.handleGetJobs)
+	mux.HandleFunc("GET /api/v1/jobs/{id}", s.handleGetJobByID)
+	mux.HandleFunc("GET /api/v1/accounts", s.handleGetAccounts)
+	mux.HandleFunc("GET /api/v1/accounts/{id}/transactions", s.handleGetAccountTransactions)
+	mux.HandleFunc("GET /api/v1/portfolio/summary", s.handleGetPortfolioSummary)
 
 	// Register "/api/" before "/" so unknown API endpoints return a structured JSON 404
 	// instead of falling through to the SPA's index.html fallback.
