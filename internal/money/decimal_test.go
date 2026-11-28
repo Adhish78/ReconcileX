@@ -64,3 +64,63 @@ func TestDecimal4ParseFormatAndArithmetic(t *testing.T) {
 		}
 	}
 }
+
+// TestDecimal6ParseFormatAndArithmetic exercises fixed-point NUMERIC(18,6) unit parsing,
+// canonical 6-decimal formatting, exact addition/subtraction/Abs, and overflow/precision guards.
+func TestDecimal6ParseFormatAndArithmetic(t *testing.T) {
+	cases := []struct {
+		input string
+		want  string
+	}{
+		{"0", "0.000000"},
+		{"33.412", "33.412000"},
+		{"-10.000", "-10.000000"},
+		{"0.0001", "0.000100"},
+		{"0.000001", "0.000001"},
+		{"-0.000000", "0.000000"},
+		{"999999999999.999999", "999999999999.999999"},
+	}
+
+	for _, tc := range cases {
+		got, err := money.ParseDecimal6(tc.input)
+		if err != nil {
+			t.Fatalf("ParseDecimal6(%q) unexpected err: %v", tc.input, err)
+		}
+		if got.String() != tc.want {
+			t.Fatalf("ParseDecimal6(%q).String() = %q, want %q", tc.input, got.String(), tc.want)
+		}
+	}
+
+	a, _ := money.ParseDecimal6("100.125")
+	b, _ := money.ParseDecimal6("-33.412")
+	sum, err := a.Add(b)
+	if err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	if sum.String() != "66.713000" {
+		t.Fatalf("100.125 + (-33.412) = %q, want 66.713000", sum.String())
+	}
+
+	diff, err := sum.Sub(a)
+	if err != nil {
+		t.Fatalf("Sub: %v", err)
+	}
+	if diff.Abs().String() != "33.412000" {
+		t.Fatalf("Abs(diff) = %q, want 33.412000", diff.Abs().String())
+	}
+
+	fromStr, err := money.ParseDecimal6JSON(json.RawMessage(`"33.412"`))
+	if err != nil || fromStr.String() != "33.412000" {
+		t.Fatalf("ParseDecimal6JSON string failed: got=%v err=%v", fromStr, err)
+	}
+	fromNum, err := money.ParseDecimal6JSON(json.RawMessage(`33.412`))
+	if err != nil || fromNum.String() != "33.412000" {
+		t.Fatalf("ParseDecimal6JSON number failed: got=%v err=%v", fromNum, err)
+	}
+
+	for _, bad := range []string{"", "abc", "12.3456789", "1000000000000.000000", "12.3.4", "NaN"} {
+		if _, err := money.ParseDecimal6(bad); err == nil {
+			t.Fatalf("expected ParseDecimal6(%q) to fail", bad)
+		}
+	}
+}
