@@ -22,6 +22,7 @@ import (
 
 	"github.com/Adhish78/ReconcileX/internal/api"
 	"github.com/Adhish78/ReconcileX/internal/db"
+	"github.com/Adhish78/ReconcileX/internal/worker"
 	"github.com/Adhish78/ReconcileX/migrations"
 	"github.com/Adhish78/ReconcileX/web"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -34,18 +35,20 @@ import (
 // config holds runtime settings resolved from environment variables (with safe
 // local defaults) and overridden by optional CLI flags.
 type config struct {
-	dsn         string // PostgreSQL connection string (RECONCILEX_DSN / -dsn).
-	port        string // TCP port the HTTP server binds to (RECONCILEX_PORT / -port).
-	autoMigrate bool   // Controls whether embedded SQL migrations run at startup (RECONCILEX_AUTO_MIGRATE / -auto-migrate).
+	dsn               string // PostgreSQL connection string (RECONCILEX_DSN / -dsn).
+	port              string // TCP port the HTTP server binds to (RECONCILEX_PORT / -port).
+	autoMigrate       bool   // Controls whether embedded SQL migrations run at startup (RECONCILEX_AUTO_MIGRATE / -auto-migrate).
+	workerConcurrency int    // Number of SKIP LOCKED worker goroutines (RECONCILEX_WORKER_CONCURRENCY / -worker-concurrency).
 }
 
 // loadConfig resolves configuration in two layers: environment variable defaults first,
 // followed by CLI flag parsing so explicit flags always take precedence.
 func loadConfig(args []string) (config, error) {
 	cfg := config{
-		dsn:         envOrDefault("RECONCILEX_DSN", "postgres://reconcilex:reconcilex@localhost:5432/reconcilex?sslmode=disable"),
-		port:        envOrDefault("RECONCILEX_PORT", "8080"),
-		autoMigrate: envBoolOrDefault("RECONCILEX_AUTO_MIGRATE", true),
+		dsn:               envOrDefault("RECONCILEX_DSN", "postgres://reconcilex:reconcilex@localhost:5432/reconcilex?sslmode=disable"),
+		port:              envOrDefault("RECONCILEX_PORT", "8080"),
+		autoMigrate:       envBoolOrDefault("RECONCILEX_AUTO_MIGRATE", true),
+		workerConcurrency: envIntOrDefault("RECONCILEX_WORKER_CONCURRENCY", 4),
 	}
 
 	// Build an isolated FlagSet instead of mutating the global flag.CommandLine
@@ -54,6 +57,7 @@ func loadConfig(args []string) (config, error) {
 	fs.StringVar(&cfg.dsn, "dsn", cfg.dsn, "PostgreSQL connection string")
 	fs.StringVar(&cfg.port, "port", cfg.port, "HTTP listen port")
 	fs.BoolVar(&cfg.autoMigrate, "auto-migrate", cfg.autoMigrate, "Run embedded SQL migrations on startup")
+	fs.IntVar(&cfg.workerConcurrency, "worker-concurrency", cfg.workerConcurrency, "Number of SKIP LOCKED worker goroutines")
 
 	if err := fs.Parse(args); err != nil {
 		return config{}, err
@@ -81,6 +85,21 @@ func envBoolOrDefault(key string, fallback bool) bool {
 
 	parsed, err := strconv.ParseBool(v)
 	if err != nil {
+		return fallback
+	}
+
+	return parsed
+}
+
+// envIntOrDefault parses a positive integer environment variable, returning fallback if unset or invalid.
+func envIntOrDefault(key string, fallback int) int {
+	v := os.Getenv(key)
+	if v == "" {
+		return fallback
+	}
+
+	parsed, err := strconv.Atoi(v)
+	if err != nil || parsed <= 0 {
 		return fallback
 	}
 
@@ -124,13 +143,19 @@ func main() {
 		log.Printf("database migrations verified")
 	}
 
-	// Step 5: Load the compiled Vite/React SPA bundle embedded at build time in web/dist.
+	// Step 5: Start SKIP LOCKED ingestion workers tied to a cancellable context.
+	workerCtx, cancelWorkers := context.WithCancel(ctx)
+	defer cancelWorkers()
+	workerPool := worker.NewPool(pool, worker.Config{Concurrency: cfg.workerConcurrency})
+	workerPool.Start(workerCtx)
+
+	// Step 6: Load the compiled Vite/React SPA bundle embedded at build time in web/dist.
 	webFS, err := web.DistFS()
 	if err != nil {
 		log.Fatalf("load embedded web assets: %v", err)
 	}
 
-	// Step 6: Wire the HTTP server with ReadHeaderTimeout to mitigate slowloris header attacks.
+	// Step 7: Wire the HTTP server with ReadHeaderTimeout to mitigate slowloris header attacks.
 	srv := &http.Server{
 		Addr:              ":" + cfg.port,
 		Handler:           api.NewServer(pool, migrations.FS, webFS),
@@ -145,9 +170,11 @@ func main() {
 		errCh <- srv.ListenAndServe()
 	}()
 
-	// Step 7: Block until either a shutdown signal arrives or ListenAndServe returns.
+	// Step 8: Block until either a shutdown signal arrives or ListenAndServe returns.
 	select {
 	case <-ctx.Done():
+		cancelWorkers()
+
 		// Allow in-flight HTTP requests up to 10 seconds to finish cleanly before exit.
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
@@ -155,8 +182,12 @@ func main() {
 		if err := srv.Shutdown(shutdownCtx); err != nil {
 			log.Printf("graceful shutdown error: %v", err)
 		}
+		workerPool.Wait()
 
 	case err := <-errCh:
+		cancelWorkers()
+		workerPool.Wait()
+
 		// http.ErrServerClosed is expected when Shutdown() closes the listener; only fail on real errors.
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatalf("http server error: %v", err)
