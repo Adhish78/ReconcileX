@@ -1,3 +1,5 @@
+// Package aa_test verifies ReBIT Account Aggregator (AA) DEPOSIT payload parsing,
+// fixed-point sign mapping, deterministic idempotency keys, and schema error wrapping.
 package aa_test
 
 import (
@@ -8,6 +10,8 @@ import (
 	"github.com/Adhish78/ReconcileX/internal/money"
 )
 
+// TestParseDepositValidPayload checks end-to-end normalization of a ReBIT DEPOSIT
+// document containing both string-encoded and number-encoded monetary amounts.
 func TestParseDepositValidPayload(t *testing.T) {
 	raw := []byte(`{
 		"fipId": "HDFC-FIP",
@@ -55,6 +59,7 @@ func TestParseDepositValidPayload(t *testing.T) {
 		}
 	}`)
 
+	// Parse the payload and verify account-level natural key and reported balance.
 	parsed, err := aa.ParseDeposit(raw)
 	if err != nil {
 		t.Fatalf("ParseDeposit unexpected err: %v", err)
@@ -83,7 +88,7 @@ func TestParseDepositValidPayload(t *testing.T) {
 		t.Fatalf("expected distinct non-empty deterministic idempotency keys")
 	}
 
-	// Same txnId produces identical deterministic idempotency_key.
+	// Same txnId produces identical deterministic idempotency_key across re-ingests.
 	if got := aa.DepositTxnIdempotencyKey("TXN-1001"); got != credit.IdempotencyKey {
 		t.Fatalf("IdempotencyKey = %q, want %q", credit.IdempotencyKey, got)
 	}
@@ -96,6 +101,8 @@ func TestParseDepositValidPayload(t *testing.T) {
 	}
 }
 
+// TestParseDepositSchemaValidationErrors ensures every structural or semantic
+// defect wraps aa.ErrSchemaValidation so workers route bad payloads to DEAD_LETTER.
 func TestParseDepositSchemaValidationErrors(t *testing.T) {
 	badPayloads := []struct {
 		name string

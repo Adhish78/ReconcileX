@@ -1,4 +1,9 @@
-// Package aa parses ReBIT Account Aggregator (AA) Financial Information payloads.
+// Package aa parses and validates ReBIT Account Aggregator (AA) Financial Information
+// payloads into normalized domain structs backed by fixed-point money.Decimal4.
+//
+// Invoked asynchronously by internal/worker after an ingestion job is claimed via
+// SKIP LOCKED, keeping HTTP ingestion (POST /api/v1/ingest) fast and decoupled from
+// payload-level schema validation.
 package aa
 
 import (
@@ -13,11 +18,17 @@ import (
 	"github.com/Adhish78/ReconcileX/internal/money"
 )
 
-// ErrSchemaValidation indicates a permanent ReBIT AA payload validation error
-// that must transition an ingestion_jobs row directly to DEAD_LETTER with ERR_SCHEMA_VALIDATION.
+// ErrSchemaValidation marks a permanent ReBIT AA payload validation failure.
+// The worker inspects errors.Is(err, ErrSchemaValidation) and moves failing jobs
+// straight to DEAD_LETTER with last_error_code = ERR_SCHEMA_VALIDATION.
 var ErrSchemaValidation = errors.New("ERR_SCHEMA_VALIDATION")
 
-// DepositPayload holds normalized account and transaction data parsed from an AA DEPOSIT payload.
+// -----------------------------------------------------------------------------
+// Normalized domain output types
+// -----------------------------------------------------------------------------
+
+// DepositPayload holds the validated Financial Account metadata and normalized
+// Ledger Transaction items extracted from a ReBIT AA DEPOSIT payload.
 type DepositPayload struct {
 	FipID             string
 	InstitutionName   string
@@ -30,7 +41,8 @@ type DepositPayload struct {
 	Transactions      []DepositTransaction
 }
 
-// DepositTransaction represents a single normalized bank deposit ledger event.
+// DepositTransaction represents a single normalized bank deposit event ready for
+// double-entry posting on ASSET:BANK vs EQUITY:EXTERNAL_CLEARING.
 type DepositTransaction struct {
 	TxnID          string
 	TxnType        string // CREDIT or DEBIT
@@ -44,6 +56,13 @@ type DepositTransaction struct {
 	RawMetadata    []byte
 }
 
+// -----------------------------------------------------------------------------
+// ReBIT AA raw JSON wire structs
+// -----------------------------------------------------------------------------
+
+// Wire structs mirror the ReBIT AA DEPOSIT Financial Information schema.
+// Numeric monetary fields stay as json.RawMessage so ParseDecimal4JSON can parse
+// both quoted strings and JSON numbers without intermediate float64 rounding.
 type rawDepositEnvelope struct {
 	FipID           string          `json:"fipId"`
 	InstitutionName string          `json:"institutionName"`
@@ -86,16 +105,24 @@ type rawDepositTxn struct {
 	Reference            string          `json:"reference"`
 }
 
+// -----------------------------------------------------------------------------
+// Parser & validation
+// -----------------------------------------------------------------------------
+
 // DepositTxnIdempotencyKey computes the deterministic per-transaction SHA-256 key
-// for AA DEPOSIT transactions: SHA256("AA_DEPOSIT|" + txnId).
+// for AA DEPOSIT rows: SHA256("AA_DEPOSIT|" + txnId). Overlapping AA fetch
+// windows produce the exact same key so unique (account_id, idempotency_key)
+// deduplicates re-ingested bank events safely.
 func DepositTxnIdempotencyKey(txnID string) string {
 	sum := sha256.Sum256([]byte("AA_DEPOSIT|" + strings.TrimSpace(txnID)))
 	return hex.EncodeToString(sum[:])
 }
 
 // ParseDeposit parses and validates a baseline ReBIT AA DEPOSIT JSON payload.
-// All schema/validation errors wrap ErrSchemaValidation.
+// Every structural or semantic validation error wraps ErrSchemaValidation so the
+// worker never retries permanently malformed payloads.
 func ParseDeposit(raw []byte) (DepositPayload, error) {
+	// Step 1: Decode outer envelope and require an Account object of type "deposit".
 	var env rawDepositEnvelope
 	if err := json.Unmarshal(raw, &env); err != nil {
 		return DepositPayload{}, fmt.Errorf("%w: invalid json: %v", ErrSchemaValidation, err)
@@ -109,6 +136,7 @@ func ParseDeposit(raw []byte) (DepositPayload, error) {
 		return DepositPayload{}, fmt.Errorf("%w: Account.type must be deposit, got %q", ErrSchemaValidation, acct.Type)
 	}
 
+	// Step 2: Derive the Financial Account natural key from fipId + linkedAccRef.
 	linkedRef := strings.TrimSpace(acct.LinkedAccRef)
 	if linkedRef == "" {
 		return DepositPayload{}, fmt.Errorf("%w: Account.linkedAccRef is required", ErrSchemaValidation)
@@ -119,6 +147,7 @@ func ParseDeposit(raw []byte) (DepositPayload, error) {
 		fipID = "UNKNOWN-FIP"
 	}
 
+	// Fall back to Summary.branch or fipID when institutionName is omitted.
 	instName := strings.TrimSpace(env.InstitutionName)
 	if instName == "" && acct.Summary != nil {
 		instName = strings.TrimSpace(acct.Summary.Branch)
@@ -127,6 +156,7 @@ func ParseDeposit(raw []byte) (DepositPayload, error) {
 		instName = fipID
 	}
 
+	// Step 3: Validate optional Summary currency (INR only) and reported balance snapshot.
 	currency := "INR"
 	var reportedBal *money.Decimal4
 	var reportedBalAt *time.Time
@@ -153,6 +183,8 @@ func ParseDeposit(raw []byte) (DepositPayload, error) {
 		}
 	}
 
+	// Step 4: Normalize every Transaction row; fail the entire batch if any item is malformed
+	// so partial AA payloads are never half-posted.
 	var txns []DepositTransaction
 	if acct.Transactions != nil {
 		txns = make([]DepositTransaction, 0, len(acct.Transactions.Transaction))
@@ -178,6 +210,8 @@ func ParseDeposit(raw []byte) (DepositPayload, error) {
 	}, nil
 }
 
+// parseDepositTransaction validates a single ReBIT AA Transaction object and maps
+// its unsigned amount + CREDIT/DEBIT direction onto a signed ASSET:BANK delta.
 func parseDepositTransaction(raw rawDepositTxn) (DepositTransaction, error) {
 	txnID := strings.TrimSpace(raw.TxnID)
 	if txnID == "" {
@@ -189,6 +223,7 @@ func parseDepositTransaction(raw rawDepositTxn) (DepositTransaction, error) {
 		return DepositTransaction{}, fmt.Errorf("invalid transaction type %q", raw.Type)
 	}
 
+	// ReBIT transaction amounts are strictly positive; direction is carried by Type.
 	amt, err := money.ParseDecimal4JSON(raw.Amount)
 	if err != nil {
 		return DepositTransaction{}, fmt.Errorf("invalid amount: %w", err)
@@ -197,6 +232,7 @@ func parseDepositTransaction(raw rawDepositTxn) (DepositTransaction, error) {
 		return DepositTransaction{}, fmt.Errorf("amount must be positive, got %s", amt.String())
 	}
 
+	// CREDIT increases ASSET:BANK (+amount); DEBIT reduces ASSET:BANK (-amount).
 	signed := amt
 	if txnType == "DEBIT" {
 		signed = amt.Neg()
@@ -217,6 +253,7 @@ func parseDepositTransaction(raw rawDepositTxn) (DepositTransaction, error) {
 		valueDate = &d
 	}
 
+	// Preserve non-accounting ReBIT attributes in raw_metadata for auditability.
 	metaMap := map[string]any{
 		"txnId": txnID,
 	}
@@ -246,6 +283,8 @@ func parseDepositTransaction(raw rawDepositTxn) (DepositTransaction, error) {
 	}, nil
 }
 
+// parseTimestamp accepts RFC3339 timestamps as well as timezone-less ISO-8601
+// date-times and calendar dates commonly emitted by Indian FIPs.
 func parseTimestamp(raw string) (time.Time, error) {
 	s := strings.TrimSpace(raw)
 	if s == "" {
@@ -265,6 +304,7 @@ func parseTimestamp(raw string) (time.Time, error) {
 	return time.Time{}, fmt.Errorf("unrecognized timestamp %q", raw)
 }
 
+// hasJSONValue reports whether a json.RawMessage field contains a non-empty, non-null value.
 func hasJSONValue(raw json.RawMessage) bool {
 	s := strings.TrimSpace(string(raw))
 	return s != "" && s != "null"
