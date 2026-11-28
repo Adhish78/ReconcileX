@@ -87,6 +87,9 @@ export function OverviewView({ persona }: PersonaViewProps) {
 
   const selectedAccount = accounts.find((a) => a.id === selectedAccountId) ?? null;
   const mutualFundHoldings = accounts.filter((a) => a.source_type === "MUTUAL_FUND");
+  const equityHoldings = accounts
+    .filter((a) => a.source_type === "EQUITY")
+    .flatMap((acct) => (acct.equity_holdings ?? []).map((holding) => ({ account: acct, holding })));
 
   function accountIdentifier(acct: AccountSummary): string {
     if (acct.masked_acc_number || acct.linked_acc_ref) {
@@ -129,6 +132,10 @@ export function OverviewView({ persona }: PersonaViewProps) {
           <div className="metric-box">
             <span className="metric-label">Mutual Funds (Cost Basis)</span>
             <span className="metric-value">{formatINR(summary.accounts_summary.mutual_funds)}</span>
+          </div>
+          <div className="metric-box">
+            <span className="metric-label">Equities (Cost Basis)</span>
+            <span className="metric-value">{formatINR(summary.accounts_summary.equities)}</span>
           </div>
           <div className="metric-box">
             <span className="metric-label">Total Liabilities</span>
@@ -223,6 +230,51 @@ export function OverviewView({ persona }: PersonaViewProps) {
                         type="button"
                         className="btn-secondary"
                         onClick={() => void handleInspectTransactions(mf.id)}
+                      >
+                        Inspect Transactions
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
+      {/* Demat Equity Holdings table highlighting per-ISIN Cost Basis and unit totals */}
+      {persona && equityHoldings.length > 0 && (
+        <div className="section-gap">
+          <h3>Demat Equity Holdings</h3>
+          <div className="table-wrap">
+            <table className="data-table">
+              <thead>
+                <tr>
+                  <th>Company</th>
+                  <th>ISIN</th>
+                  <th>Demat Account</th>
+                  <th>Cost Basis</th>
+                  <th>Ledger Units</th>
+                  <th>Reported Units</th>
+                  <th>Last Price</th>
+                  <th>Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {equityHoldings.map(({ account: acct, holding: eq }) => (
+                  <tr key={`${acct.id}-${eq.isin}`} className={acct.id === selectedAccountId ? "is-selected" : ""}>
+                    <td>{eq.issuer_name || eq.isin_description || acct.institution_name}</td>
+                    <td className="mono">{eq.isin}</td>
+                    <td className="mono">{accountIdentifier(acct)}</td>
+                    <td className="mono">{formatINR(eq.cost_basis)}</td>
+                    <td className="mono">{formatUnits(eq.ledger_units)}</td>
+                    <td className="mono">{eq.reported_units ? formatUnits(eq.reported_units) : "—"}</td>
+                    <td className="mono">{eq.last_traded_price ? formatINR(eq.last_traded_price) : "—"}</td>
+                    <td>
+                      <button
+                        type="button"
+                        className="btn-secondary"
+                        onClick={() => void handleInspectTransactions(acct.id)}
                       >
                         Inspect Transactions
                       </button>

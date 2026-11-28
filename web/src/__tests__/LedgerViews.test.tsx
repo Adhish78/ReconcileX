@@ -797,4 +797,151 @@ describe("Overview Accounts, Transaction Drilldown, and Workbench Jobs", () => {
       expect(root.textContent).toContain("COMPLETED");
     });
   });
+
+  it("displays demat equity holdings (Cost Basis and units per ISIN) and Corporate Action drilldown on Overview", async () => {
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = typeof input === "string" ? input : input.toString();
+
+      if (url === "/api/v1/personas") {
+        return jsonResponse({
+          personas: [
+            { id: "u1", persona_slug: "aarav", display_name: "Aarav Sharma", linked_identity_count: 2 }
+          ]
+        });
+      }
+      if (url === "/api/v1/portfolio/summary?persona=aarav") {
+        return jsonResponse({
+          persona: { id: "u1", persona_slug: "aarav", display_name: "Aarav Sharma" },
+          as_of: "2026-06-15T14:20:10Z",
+          net_worth: "88000.0000",
+          total_assets: "88000.0000",
+          total_liabilities: "0.0000",
+          portfolio_xirr: null,
+          accounts_summary: {
+            bank_deposits: "0.0000",
+            mutual_funds: "0.0000",
+            equities: "88000.0000",
+            loans: "0.0000",
+            credit_cards: "0.0000"
+          },
+          open_alert_count: 0,
+          uncategorized_count: 0,
+          dlq_job_count: 0
+        });
+      }
+      if (url === "/api/v1/accounts?persona=aarav") {
+        return jsonResponse({
+          accounts: [
+            {
+              id: "eq-1",
+              canonical_user_id: "u1",
+              source_type: "EQUITY",
+              natural_key: "CDSL-FIP|DEMAT-001",
+              institution_name: "Zerodha Broking (CDSL)",
+              fip_id: "CDSL-FIP",
+              linked_acc_ref: "DEMAT-001",
+              masked_acc_number: "XXXXXXXXXXXX0987",
+              currency: "INR",
+              ledger_balance: "88000.0000",
+              ledger_units: "80.000000",
+              reported_balance: "248000.0000",
+              reported_units: "80.000000",
+              open_alert_count: 0,
+              equity_holdings: [
+                {
+                  isin: "INE002A01018",
+                  issuer_name: "RELIANCE INDUSTRIES LTD",
+                  isin_description: "RELIANCE INDUSTRIES LTD EQ",
+                  cost_basis: "50000.0000",
+                  ledger_units: "60.000000",
+                  reported_units: "60.000000",
+                  last_traded_price: "2800.0000"
+                },
+                {
+                  isin: "INE467B01029",
+                  issuer_name: "TATA CONSULTANCY SERVICES LTD",
+                  isin_description: "TCS LTD EQ",
+                  cost_basis: "38000.0000",
+                  ledger_units: "20.000000",
+                  reported_units: "20.000000",
+                  last_traded_price: "4000.0000"
+                }
+              ]
+            }
+          ]
+        });
+      }
+      if (url.startsWith("/api/v1/accounts/eq-1/transactions")) {
+        return jsonResponse({
+          account_id: "eq-1",
+          total: 2,
+          transactions: [
+            {
+              id: "txn-eq-bonus",
+              account_id: "eq-1",
+              source: "AA_EQUITIES",
+              txn_type: "BONUS",
+              category: null,
+              txn_timestamp: "2025-04-01T09:00:00+05:30",
+              narration: "BONUS 1:2",
+              reference: null,
+              idempotency_key: "k-eq-bonus",
+              entries: [
+                { id: "ee1", coa_account: "ASSET:EQUITY_COST", amount: "0.0000", units: "20.000000" }
+              ]
+            },
+            {
+              id: "txn-eq-buy",
+              account_id: "eq-1",
+              source: "AA_EQUITIES",
+              txn_type: "BUY",
+              category: null,
+              txn_timestamp: "2025-02-10T10:00:00+05:30",
+              narration: "BUY",
+              reference: "ORD-1",
+              idempotency_key: "k-eq-buy",
+              entries: [
+                { id: "ee2", coa_account: "ASSET:EQUITY_COST", amount: "50000.0000", units: "20.000000" },
+                { id: "ee3", coa_account: "EQUITY:EXTERNAL_CLEARING", amount: "-50000.0000", units: null }
+              ]
+            }
+          ]
+        });
+      }
+
+      return jsonResponse({ error: { code: "ERR_NOT_FOUND", message: "not found" } }, 404);
+    });
+
+    handle = await renderIntoDocument(<App />);
+    const root = handle.container;
+
+    await waitForCondition(() => {
+      expect(root.textContent).toContain("Equities (Cost Basis)");
+      expect(root.textContent).toContain("Demat Equity Holdings");
+      expect(root.textContent).toContain("RELIANCE INDUSTRIES LTD");
+      expect(root.textContent).toContain("INE002A01018");
+      expect(root.textContent).toContain("50,000.00");
+      expect(root.textContent).toContain("60.0000");
+      expect(root.textContent).toContain("2,800.00");
+      expect(root.textContent).toContain("TATA CONSULTANCY SERVICES LTD");
+      expect(root.textContent).toContain("INE467B01029");
+      expect(root.textContent).toContain("38,000.00");
+      expect(root.textContent).toContain("20.0000");
+    });
+
+    const inspectBtn = Array.from(root.querySelectorAll("button")).find((b) =>
+      b.textContent?.includes("Inspect Transactions")
+    );
+    expect(inspectBtn).toBeDefined();
+
+    await act(async () => {
+      inspectBtn!.click();
+    });
+
+    await waitForCondition(() => {
+      expect(root.textContent).toContain("BONUS 1:2");
+      expect(root.textContent).toContain("ASSET:EQUITY_COST");
+      expect(root.textContent).toContain("20.0000 units");
+    });
+  });
 });

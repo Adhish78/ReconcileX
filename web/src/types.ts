@@ -39,6 +39,19 @@ export interface PersonaViewProps {
 }
 
 /**
+ * Per-ISIN demat equity holding inside an EQUITY Financial Account.
+ */
+export interface EquityHoldingSummary {
+  isin: string;
+  issuer_name: string;
+  isin_description: string;
+  cost_basis: string;
+  ledger_units: string;
+  reported_units?: string | null;
+  last_traded_price?: string | null;
+}
+
+/**
  * Reconcilable Financial Account returned by GET /api/v1/accounts.
  * Decimal strings remain unparsed to preserve fixed-point NUMERIC(18,4) precision.
  */
@@ -62,6 +75,7 @@ export interface AccountSummary {
   reported_units?: string | null;
   reported_balance_at?: string | null;
   open_alert_count: number;
+  equity_holdings?: EquityHoldingSummary[];
 }
 
 /**
