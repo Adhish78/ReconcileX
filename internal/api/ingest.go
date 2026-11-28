@@ -59,6 +59,8 @@ type JobSummary struct {
 	AttemptCount     int        `json:"attempt_count"`
 	MaxAttempts      int        `json:"max_attempts"`
 	ReplayCount      int        `json:"replay_count"`
+	NextRunAt        time.Time  `json:"next_run_at"`
+	ReplayedAt       *time.Time `json:"replayed_at"`
 	LastErrorCode    *string    `json:"last_error_code"`
 	LastErrorMessage *string    `json:"last_error_message"`
 	CreatedAt        time.Time  `json:"created_at"`
@@ -69,6 +71,11 @@ type JobSummary struct {
 // JobDetail extends JobSummary with the full raw JSON payload for DLQ inspection.
 type JobDetail struct {
 	JobSummary
+	Payload json.RawMessage `json:"payload"`
+}
+
+// replayRequest is the optional JSON body accepted by POST /api/v1/jobs/{id}/replay.
+type replayRequest struct {
 	Payload json.RawMessage `json:"payload"`
 }
 
@@ -85,8 +92,8 @@ type jobDetailResponse struct {
 // Shared SQL projections & validation helpers
 // -----------------------------------------------------------------------------
 
-// Shared column list kept in strict lockstep with scanJobSummary so list and
-// detail queries scan identical fields.
+// Shared column list kept in strict lockstep with scanJobSummary so list,
+// detail, and replay queries scan identical fields.
 const jobSummaryColumns = `
 	id::text,
 	canonical_user_id::text,
@@ -96,6 +103,8 @@ const jobSummaryColumns = `
 	attempt_count,
 	max_attempts,
 	replay_count,
+	next_run_at,
+	replayed_at,
 	last_error_code,
 	last_error_message,
 	created_at,
@@ -109,10 +118,45 @@ func scanJobSummary(row pgx.Row, extraDest ...any) (JobSummary, error) {
 	dest := append([]any{
 		&j.ID, &j.CanonicalUserID, &j.SourceType, &j.IdempotencyKey,
 		&j.Status, &j.AttemptCount, &j.MaxAttempts, &j.ReplayCount,
+		&j.NextRunAt, &j.ReplayedAt,
 		&j.LastErrorCode, &j.LastErrorMessage, &j.CreatedAt, &j.UpdatedAt, &j.CompletedAt,
 	}, extraDest...)
 	err := row.Scan(dest...)
 	return j, err
+}
+
+type validatedPayload struct {
+	Raw    string
+	SHA256 string
+}
+
+// validateAndHashPayloadObject checks that raw is a JSON object (not an array,
+// scalar, or null) and returns its canonical string and SHA-256 hex digest.
+func validateAndHashPayloadObject(raw json.RawMessage) (validatedPayload, bool) {
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &obj); err != nil || obj == nil {
+		return validatedPayload{}, false
+	}
+	sum := sha256.Sum256(raw)
+	return validatedPayload{
+		Raw:    string(raw),
+		SHA256: hex.EncodeToString(sum[:]),
+	}, true
+}
+
+// resolveOptionalPersonaFilter resolves an optional ?persona=<slug> query param
+// into a Canonical User UUID string, returning ("", true) when omitted or writing
+// an error response and returning ("", false) when lookup fails.
+func (s *server) resolveOptionalPersonaFilter(ctx context.Context, w http.ResponseWriter, slug string) (string, bool) {
+	trimmed := strings.TrimSpace(slug)
+	if trimmed == "" {
+		return "", true
+	}
+	persona, ok := s.resolvePersonaOrError(ctx, w, trimmed)
+	if !ok {
+		return "", false
+	}
+	return persona.ID, true
 }
 
 // isAllowedIngestSource whitelists supported feed names at the enqueue boundary.
@@ -169,8 +213,8 @@ func (s *server) handlePostIngest(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Require payload to be a JSON object rather than an array, scalar, or null.
-	var payloadObj map[string]json.RawMessage
-	if err := json.Unmarshal(req.Payload, &payloadObj); err != nil || payloadObj == nil {
+	validated, ok := validateAndHashPayloadObject(req.Payload)
+	if !ok {
 		writeError(w, http.StatusBadRequest, errCodeInvalidRequest, "payload must be a JSON object", nil)
 		return
 	}
@@ -194,14 +238,11 @@ func (s *server) handlePostIngest(w http.ResponseWriter, r *http.Request) {
 		canonicalUserID = &uid
 	}
 
-	// Step 3: Capture optional Idempotency-Key header and hash raw payload for auditability.
+	// Step 3: Capture optional Idempotency-Key header.
 	var idempotencyKey *string
 	if rawKey := strings.TrimSpace(r.Header.Get("Idempotency-Key")); rawKey != "" {
 		idempotencyKey = &rawKey
 	}
-
-	sum := sha256.Sum256(req.Payload)
-	payloadSHA := hex.EncodeToString(sum[:])
 
 	// Step 4: Insert the PENDING job; ON CONFLICT DO NOTHING detects matching
 	// non-null Idempotency-Key headers without failing the transaction.
@@ -211,7 +252,7 @@ func (s *server) handlePostIngest(w http.ResponseWriter, r *http.Request) {
 		VALUES ($1, $2, $3, $4::jsonb, $5)
 		ON CONFLICT (idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
 		RETURNING id::text, status::text, idempotency_key
-	`, canonicalUserID, req.SourceType, idempotencyKey, string(req.Payload), payloadSHA).Scan(&resp.JobID, &resp.Status, &resp.IdempotencyKey)
+	`, canonicalUserID, req.SourceType, idempotencyKey, validated.Raw, validated.SHA256).Scan(&resp.JobID, &resp.Status, &resp.IdempotencyKey)
 
 	// When ON CONFLICT skipped the insert, return the existing job with 200 OK.
 	if errors.Is(err, pgx.ErrNoRows) && idempotencyKey != nil {
@@ -259,13 +300,9 @@ func (s *server) handleGetJobs(w http.ResponseWriter, r *http.Request) {
 
 	// Resolve optional ?persona=<slug> into canonical_user_id so callers can scope
 	// the queue to a single Persona without exposing other Personas' jobs.
-	var userFilter string
-	if slug := strings.TrimSpace(q.Get("persona")); slug != "" {
-		persona, ok := s.resolvePersonaOrError(ctx, w, slug)
-		if !ok {
-			return
-		}
-		userFilter = persona.ID
+	userFilter, ok := s.resolveOptionalPersonaFilter(ctx, w, q.Get("persona"))
+	if !ok {
+		return
 	}
 
 	// Count total matching jobs for pagination before fetching the requested slice.
@@ -331,13 +368,9 @@ func (s *server) handleGetJobByID(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 
-	var userFilter string
-	if slug := strings.TrimSpace(r.URL.Query().Get("persona")); slug != "" {
-		persona, ok := s.resolvePersonaOrError(ctx, w, slug)
-		if !ok {
-			return
-		}
-		userFilter = persona.ID
+	userFilter, ok := s.resolveOptionalPersonaFilter(ctx, w, r.URL.Query().Get("persona"))
+	if !ok {
+		return
 	}
 
 	var payload json.RawMessage
@@ -360,6 +393,118 @@ func (s *server) handleGetJobByID(w http.ResponseWriter, r *http.Request) {
 		Job: JobDetail{
 			JobSummary: summary,
 			Payload:    payload,
+		},
+	})
+}
+
+// handlePostJobReplay serves POST /api/v1/jobs/{id}/replay.
+// Transitions a DEAD_LETTER job back to PENDING, resets attempt_count = 0,
+// increments replay_count, records replayed_at, and optionally replaces payload
+// and payload_sha256 when a replacement JSON object is provided.
+func (s *server) handlePostJobReplay(w http.ResponseWriter, r *http.Request) {
+	if !s.requirePool(w) {
+		return
+	}
+
+	jobID := strings.TrimSpace(r.PathValue("id"))
+	if !isValidUUID(jobID) {
+		writeError(w, http.StatusBadRequest, errCodeInvalidRequest, "invalid job id", map[string]any{"id": jobID})
+		return
+	}
+
+	bodyBytes, err := io.ReadAll(io.LimitReader(r.Body, 8<<20))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, errCodeInvalidRequest, "failed to read request body", nil)
+		return
+	}
+
+	// Empty body (or omitted/null payload) replays the stored payload as-is;
+	// a non-null payload must be a valid JSON object replacing payload + payload_sha256.
+	var newPayloadStr *string
+	var newPayloadSHA *string
+	if len(bytes.TrimSpace(bodyBytes)) > 0 {
+		var req replayRequest
+		dec := json.NewDecoder(bytes.NewReader(bodyBytes))
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(&req); err != nil {
+			writeError(w, http.StatusBadRequest, errCodeInvalidRequest, "invalid JSON request body", map[string]any{"reason": err.Error()})
+			return
+		}
+		var trailing any
+		if err := dec.Decode(&trailing); !errors.Is(err, io.EOF) {
+			writeError(w, http.StatusBadRequest, errCodeInvalidRequest, "unexpected trailing JSON data", nil)
+			return
+		}
+		trimmedPayload := bytes.TrimSpace(req.Payload)
+		if len(trimmedPayload) > 0 && string(trimmedPayload) != "null" {
+			validated, ok := validateAndHashPayloadObject(req.Payload)
+			if !ok {
+				writeError(w, http.StatusBadRequest, errCodeInvalidRequest, "payload must be a JSON object", nil)
+				return
+			}
+			newPayloadStr = &validated.Raw
+			newPayloadSHA = &validated.SHA256
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	userFilter, ok := s.resolveOptionalPersonaFilter(ctx, w, r.URL.Query().Get("persona"))
+	if !ok {
+		return
+	}
+
+	var outPayload json.RawMessage
+	summary, err := scanJobSummary(s.pool.QueryRow(ctx, `
+		UPDATE ingestion_jobs
+		SET status = 'PENDING',
+		    attempt_count = 0,
+		    next_run_at = NOW(),
+		    locked_by = NULL,
+		    locked_until = NULL,
+		    last_error_code = NULL,
+		    last_error_message = NULL,
+		    completed_at = NULL,
+		    replay_count = replay_count + 1,
+		    replayed_at = NOW(),
+		    updated_at = NOW(),
+		    payload = COALESCE($3::jsonb, payload),
+		    payload_sha256 = COALESCE($4, payload_sha256)
+		WHERE id = $1
+		  AND ($2 = '' OR canonical_user_id::text = $2)
+		  AND status = 'DEAD_LETTER'
+		RETURNING `+jobSummaryColumns+`, payload
+	`, jobID, userFilter, newPayloadStr, newPayloadSHA), &outPayload)
+
+	if errors.Is(err, pgx.ErrNoRows) {
+		var currentStatus string
+		lookupErr := s.pool.QueryRow(ctx, `
+			SELECT status::text
+			FROM ingestion_jobs
+			WHERE id = $1
+			  AND ($2 = '' OR canonical_user_id::text = $2)
+		`, jobID, userFilter).Scan(&currentStatus)
+		if errors.Is(lookupErr, pgx.ErrNoRows) {
+			writeError(w, http.StatusNotFound, errCodeNotFound, "job not found", map[string]any{"id": jobID})
+			return
+		}
+		if lookupErr != nil {
+			writeError(w, http.StatusServiceUnavailable, errCodeDBUnavailable, "failed to inspect job status", map[string]any{"reason": lookupErr.Error()})
+			return
+		}
+		writeError(w, http.StatusConflict, errCodeJobNotReplayable, "only DEAD_LETTER jobs can be replayed", map[string]any{"id": jobID, "status": currentStatus})
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, errCodeDBUnavailable, "failed to replay job", map[string]any{"reason": err.Error()})
+		return
+	}
+
+	writeJSON(w, http.StatusAccepted, jobDetailResponse{
+		Job: JobDetail{
+			JobSummary: summary,
+			Payload:    outPayload,
 		},
 	})
 }

@@ -540,3 +540,205 @@ func TestIngestJobsAccountsTransactionsAndPortfolioSummary(t *testing.T) {
 		t.Fatalf("unexpected portfolio summary: %+v", sumResp)
 	}
 }
+
+// TestPostJobReplayLifecycleAndValidation exercises POST /api/v1/jobs/{id}/replay:
+//   - 400 ERR_INVALID_REQUEST for bad UUID or non-object payload
+//   - 404 ERR_NOT_FOUND for unknown job or mismatched ?persona=
+//   - 409 ERR_JOB_NOT_REPLAYABLE for non-DEAD_LETTER jobs
+//   - 202 Accepted empty-body replay preserving existing payload
+//   - 202 Accepted payload-replacement replay updating payload + payload_sha256,
+//     resetting attempt_count=0, incrementing replay_count, setting replayed_at,
+//     and allowing the worker to complete the repaired job end-to-end.
+func TestPostJobReplayLifecycleAndValidation(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	pool := openTestPool(t, true)
+
+	var aaravID, priyaID string
+	if err := pool.QueryRow(ctx,
+		`INSERT INTO users (persona_slug, display_name, status) VALUES ('aarav', 'Aarav Sharma', 'ACTIVE') RETURNING id::text`,
+	).Scan(&aaravID); err != nil {
+		t.Fatalf("insert aarav: %v", err)
+	}
+	if err := pool.QueryRow(ctx,
+		`INSERT INTO users (persona_slug, display_name, status) VALUES ('priya', 'Priya Nair', 'ACTIVE') RETURNING id::text`,
+	).Scan(&priyaID); err != nil {
+		t.Fatalf("insert priya: %v", err)
+	}
+
+	// Seed one broken AA_DEPOSIT job (missing linkedAccRef) and let worker move it to DEAD_LETTER.
+	badIngest := httptest.NewRequest(http.MethodPost, "/api/v1/ingest", bytes.NewBufferString(`{
+		"source_type": "AA_DEPOSIT",
+		"persona_slug": "aarav",
+		"payload": {"fipId": "HDFC-FIP", "Account": {"type": "deposit"}}
+	}`))
+	srv := api.NewServer(pool, migrations.FS, stubWebFS())
+	badRec := httptest.NewRecorder()
+	srv.ServeHTTP(badRec, badIngest)
+	if badRec.Code != http.StatusAccepted {
+		t.Fatalf("enqueue broken job expected 202, got %d: %s", badRec.Code, badRec.Body.String())
+	}
+	var enqueued struct {
+		JobID string `json:"job_id"`
+	}
+	if err := json.Unmarshal(badRec.Body.Bytes(), &enqueued); err != nil {
+		t.Fatalf("decode enqueue: %v", err)
+	}
+
+	proc := worker.NewPool(pool, worker.Config{Concurrency: 1})
+	if claimed, err := proc.ProcessOne(ctx, "replay-test-worker"); err != nil || !claimed {
+		t.Fatalf("ProcessOne broken job: claimed=%v err=%v", claimed, err)
+	}
+
+	// Simulate prior retry attempts before DLQ so we verify replay resets attempt_count = 0.
+	if _, err := pool.Exec(ctx, `UPDATE ingestion_jobs SET attempt_count = 3 WHERE id = $1`, enqueued.JobID); err != nil {
+		t.Fatalf("set attempt_count: %v", err)
+	}
+
+	// Case 1: Invalid UUID returns 400 ERR_INVALID_REQUEST.
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/jobs/not-a-uuid/replay", nil)
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest || decodeErrorCode(t, rec.Body.Bytes()) != "ERR_INVALID_REQUEST" {
+		t.Fatalf("invalid uuid expected 400 ERR_INVALID_REQUEST, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// Case 2: Wrong persona or unknown ID returns 404 ERR_NOT_FOUND.
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/jobs/"+enqueued.JobID+"/replay?persona=priya", nil)
+	rec = httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound || decodeErrorCode(t, rec.Body.Bytes()) != "ERR_NOT_FOUND" {
+		t.Fatalf("wrong persona expected 404 ERR_NOT_FOUND, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// Case 3: Non-object payload or unknown field in replay body returns 400 ERR_INVALID_REQUEST.
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/jobs/"+enqueued.JobID+"/replay", bytes.NewBufferString(`{"payload":"invalid"}`))
+	rec = httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest || decodeErrorCode(t, rec.Body.Bytes()) != "ERR_INVALID_REQUEST" {
+		t.Fatalf("non-object payload expected 400 ERR_INVALID_REQUEST, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/jobs/"+enqueued.JobID+"/replay", bytes.NewBufferString(`{"paylaod":{}}`))
+	rec = httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest || decodeErrorCode(t, rec.Body.Bytes()) != "ERR_INVALID_REQUEST" {
+		t.Fatalf("unknown field expected 400 ERR_INVALID_REQUEST, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// Case 4: Empty-body replay resets DEAD_LETTER -> PENDING, attempt_count=0, replay_count=1, sets replayed_at.
+	var origSHA string
+	if err := pool.QueryRow(ctx, `SELECT payload_sha256 FROM ingestion_jobs WHERE id = $1`, enqueued.JobID).Scan(&origSHA); err != nil {
+		t.Fatalf("read orig sha: %v", err)
+	}
+
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/jobs/"+enqueued.JobID+"/replay?persona=aarav", nil)
+	rec = httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("empty replay expected 202, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var replayResp struct {
+		Job struct {
+			ID               string  `json:"id"`
+			Status           string  `json:"status"`
+			AttemptCount     int     `json:"attempt_count"`
+			ReplayCount      int     `json:"replay_count"`
+			ReplayedAt       *string `json:"replayed_at"`
+			LastErrorCode    *string `json:"last_error_code"`
+			LastErrorMessage *string `json:"last_error_message"`
+		} `json:"job"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &replayResp); err != nil {
+		t.Fatalf("decode replay response: %v", err)
+	}
+	if replayResp.Job.Status != "PENDING" || replayResp.Job.AttemptCount != 0 || replayResp.Job.ReplayCount != 1 || replayResp.Job.ReplayedAt == nil || replayResp.Job.LastErrorCode != nil {
+		t.Fatalf("unexpected empty replay job state: %+v", replayResp.Job)
+	}
+
+	var shaAfterEmpty string
+	if err := pool.QueryRow(ctx, `SELECT payload_sha256 FROM ingestion_jobs WHERE id = $1`, enqueued.JobID).Scan(&shaAfterEmpty); err != nil {
+		t.Fatalf("read sha after empty replay: %v", err)
+	}
+	if shaAfterEmpty != origSHA {
+		t.Fatalf("expected payload_sha256 preserved on empty replay, got %s != %s", shaAfterEmpty, origSHA)
+	}
+
+	// Case 5: Replaying a PENDING job fails with 409 ERR_JOB_NOT_REPLAYABLE.
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/jobs/"+enqueued.JobID+"/replay", nil)
+	rec = httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusConflict || decodeErrorCode(t, rec.Body.Bytes()) != "ERR_JOB_NOT_REPLAYABLE" {
+		t.Fatalf("replaying PENDING job expected 409 ERR_JOB_NOT_REPLAYABLE, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// Let worker fail the unedited job back to DEAD_LETTER, then repair payload via replay.
+	if claimed, err := proc.ProcessOne(ctx, "replay-test-worker"); err != nil || !claimed {
+		t.Fatalf("ProcessOne unedited replay: claimed=%v err=%v", claimed, err)
+	}
+
+	repairedBody := `{
+		"payload": {
+			"fipId": "HDFC-FIP",
+			"institutionName": "HDFC Bank",
+			"Account": {
+				"type": "deposit",
+				"maskedAccNumber": "XXXXXXXX4020",
+				"version": "2.0.0",
+				"linkedAccRef": "HDFC-4020",
+				"Summary": {
+					"currentBalance": "2500.00",
+					"currency": "INR",
+					"balanceDateTime": "2026-06-15T14:20:10+05:30"
+				},
+				"Transactions": {
+					"Transaction": [{
+						"txnId": "REPLAY-TXN-1",
+						"type": "CREDIT",
+						"mode": "NEFT",
+						"amount": "2500.00",
+						"transactionTimestamp": "2026-06-15T09:00:00+05:30",
+						"narration": "NEFT REPLAYED"
+					}]
+				}
+			}
+		}
+	}`
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/jobs/"+enqueued.JobID+"/replay", bytes.NewBufferString(repairedBody))
+	rec = httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("repaired replay expected 202, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &replayResp); err != nil {
+		t.Fatalf("decode repaired replay response: %v", err)
+	}
+	if replayResp.Job.Status != "PENDING" || replayResp.Job.ReplayCount != 2 || replayResp.Job.AttemptCount != 0 {
+		t.Fatalf("unexpected repaired replay state: %+v", replayResp.Job)
+	}
+
+	var newSHA string
+	if err := pool.QueryRow(ctx, `SELECT payload_sha256 FROM ingestion_jobs WHERE id = $1`, enqueued.JobID).Scan(&newSHA); err != nil {
+		t.Fatalf("read new sha: %v", err)
+	}
+	if newSHA == origSHA || newSHA == "" {
+		t.Fatalf("expected payload_sha256 to change on payload replacement, got %q", newSHA)
+	}
+
+	// Process the repaired job and confirm COMPLETED + posted balance.
+	if claimed, err := proc.ProcessOne(ctx, "replay-test-worker"); err != nil || !claimed {
+		t.Fatalf("ProcessOne repaired job: claimed=%v err=%v", claimed, err)
+	}
+	var finalStatus, bankBal string
+	if err := pool.QueryRow(ctx, `SELECT status::text FROM ingestion_jobs WHERE id = $1`, enqueued.JobID).Scan(&finalStatus); err != nil {
+		t.Fatalf("query final status: %v", err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT COALESCE(SUM(amount), 0)::text FROM ledger_entries WHERE coa_account = 'ASSET:BANK'`).Scan(&bankBal); err != nil {
+		t.Fatalf("query bank balance: %v", err)
+	}
+	if finalStatus != "COMPLETED" || bankBal != "2500.0000" {
+		t.Fatalf("expected COMPLETED and 2500.0000 after replay, got status=%s bal=%s", finalStatus, bankBal)
+	}
+}

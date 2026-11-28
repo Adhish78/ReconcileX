@@ -28,10 +28,11 @@ import (
 // Machine-readable error codes serialized inside apiErrorBody.Code so frontend
 // and API consumers can branch reliably without parsing human messages.
 const (
-	errCodeDBUnavailable   = "ERR_DB_UNAVAILABLE"
-	errCodePersonaNotFound = "ERR_PERSONA_NOT_FOUND"
-	errCodeNotFound        = "ERR_NOT_FOUND"
-	errCodeInvalidRequest  = "ERR_INVALID_REQUEST"
+	errCodeDBUnavailable    = "ERR_DB_UNAVAILABLE"
+	errCodePersonaNotFound  = "ERR_PERSONA_NOT_FOUND"
+	errCodeNotFound         = "ERR_NOT_FOUND"
+	errCodeInvalidRequest   = "ERR_INVALID_REQUEST"
+	errCodeJobNotReplayable = "ERR_JOB_NOT_REPLAYABLE"
 )
 
 // Persona represents an ACTIVE Canonical User returned by GET /api/v1/personas,
@@ -88,6 +89,7 @@ func NewServer(pool *pgxpool.Pool, migrationsFS fs.FS, webFS fs.FS) http.Handler
 	mux.HandleFunc("POST /api/v1/ingest", s.handlePostIngest)
 	mux.HandleFunc("GET /api/v1/jobs", s.handleGetJobs)
 	mux.HandleFunc("GET /api/v1/jobs/{id}", s.handleGetJobByID)
+	mux.HandleFunc("POST /api/v1/jobs/{id}/replay", s.handlePostJobReplay)
 	mux.HandleFunc("GET /api/v1/accounts", s.handleGetAccounts)
 	mux.HandleFunc("GET /api/v1/accounts/{id}/transactions", s.handleGetAccountTransactions)
 	mux.HandleFunc("GET /api/v1/portfolio/summary", s.handleGetPortfolioSummary)
