@@ -1,17 +1,22 @@
 -- =============================================================================
 -- Migration 0002: Double-Entry Ledger Core, Accounts, and Ingestion Jobs
 --
--- Establishes the immutable double-entry ledger schema (ADR-0003) and the
--- PostgreSQL SKIP LOCKED job queue:
---   - Enums: coa_account (13 buckets), canonical_category (17 values),
---     account_source_type, job_status
---   - Tables: accounts, ingestion_jobs, ledger_transactions, ledger_entries
---   - Covering index on ledger_entries for zero-heap-fetch balance aggregation
---   - Database triggers enforcing zero-sum transactions (DEFERRABLE),
---     append-only ledger_entries, and category-only updates on ledger_transactions
+-- Owns the immutable double-entry ledger schema (ADR-0003) and the PostgreSQL
+-- SKIP LOCKED asynchronous ingestion queue. Downstream consumers include:
+--   - internal/worker: claims PENDING jobs, upserts Financial Accounts, and
+--     posts zero-sum Ledger Transactions and Ledger Entries.
+--   - internal/api: serves /api/v1/ingest, /api/v1/jobs, /api/v1/accounts, and
+--     /api/v1/portfolio/summary using live ledger_entries aggregation.
 -- =============================================================================
 
--- 13-bucket Chart of Accounts used for zero-sum double-entry ledger postings.
+
+-- -----------------------------------------------------------------------------
+-- Domain Enums
+-- -----------------------------------------------------------------------------
+
+-- 13-bucket Chart of Accounts used exclusively for zero-sum double-entry balancing.
+-- Kept separate from Canonical Category so analytical reclassification never mutates
+-- accounting legs.
 CREATE TYPE coa_account AS ENUM (
     'ASSET:BANK',
     'ASSET:MF_COST',
@@ -28,7 +33,8 @@ CREATE TYPE coa_account AS ENUM (
     'INCOME:SALARY_DIVIDEND'
 );
 
--- 17-value analytical Canonical Category enum kept separate from Chart of Accounts.
+-- 17-value analytical Canonical Category enum assigned to Ledger Transactions.
+-- UNCATEGORIZED_REVIEW acts as the explicit terminal fallback for human review.
 CREATE TYPE canonical_category AS ENUM (
     'TRANSFER:INVESTMENT',
     'TRANSFER:CARD_PAYMENT',
@@ -49,7 +55,7 @@ CREATE TYPE canonical_category AS ENUM (
     'UNCATEGORIZED_REVIEW'
 );
 
--- Supported Financial Account source types across AA, CAS, and Liabilities.
+-- Supported Financial Account container types across AA, CAS, and Liability feeds.
 CREATE TYPE account_source_type AS ENUM (
     'DEPOSIT',
     'MUTUAL_FUND',
@@ -59,7 +65,7 @@ CREATE TYPE account_source_type AS ENUM (
     'CREDIT_CARD'
 );
 
--- Lifecycle states for asynchronous SKIP LOCKED ingestion_jobs processing.
+-- Lifecycle states for asynchronous FOR UPDATE SKIP LOCKED ingestion_jobs processing.
 CREATE TYPE job_status AS ENUM (
     'PENDING',
     'PROCESSING',
@@ -73,8 +79,8 @@ CREATE TYPE job_status AS ENUM (
 -- Table: accounts (Financial Accounts)
 --
 -- One row per reconcilable Financial Account owned by a Canonical User.
--- Computed balances and units are never cached here; they are aggregated live
--- from ledger_entries.
+-- Computed balances and units are never cached on this table; they are always
+-- aggregated live from ledger_entries to prevent cached-balance drift (ADR-0003).
 -- -----------------------------------------------------------------------------
 CREATE TABLE accounts (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -89,6 +95,8 @@ CREATE TABLE accounts (
     isin TEXT,
     scheme_code INTEGER,
     currency CHAR(3) NOT NULL DEFAULT 'INR',
+
+    -- Latest institution-reported snapshot used later for Drift reconciliation checks.
     reported_balance NUMERIC(18,4),
     reported_units NUMERIC(18,6),
     reported_balance_at TIMESTAMPTZ,
@@ -96,10 +104,14 @@ CREATE TABLE accounts (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 
+    -- Deduplicate re-ingested statements onto the same Financial Account per owner.
     CONSTRAINT accounts_user_source_key_unique UNIQUE (canonical_user_id, source_type, natural_key)
 );
 
+-- Speeds up persona-scoped account listings and summary rollups.
 CREATE INDEX idx_accounts_user_source ON accounts (canonical_user_id, source_type);
+
+-- Partial index for AMFI scheme lookups on mutual fund holdings.
 CREATE INDEX idx_accounts_scheme_code ON accounts (scheme_code) WHERE scheme_code IS NOT NULL;
 
 
@@ -107,9 +119,13 @@ CREATE INDEX idx_accounts_scheme_code ON accounts (scheme_code) WHERE scheme_cod
 -- Table: ingestion_jobs
 --
 -- PostgreSQL-backed asynchronous ingestion queue claimed via FOR UPDATE SKIP LOCKED.
+-- Enqueued synchronously by POST /api/v1/ingest and drained by internal/worker.
 -- -----------------------------------------------------------------------------
 CREATE TABLE ingestion_jobs (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+
+    -- Nullable because unlinked payloads may arrive without a persona_slug and
+    -- resolve or create their Canonical User asynchronously inside the worker.
     canonical_user_id UUID REFERENCES users(id),
     source_type TEXT NOT NULL,
     idempotency_key TEXT,
@@ -118,9 +134,13 @@ CREATE TABLE ingestion_jobs (
     payload_sha256 TEXT NOT NULL,
     attempt_count INT NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
     max_attempts INT NOT NULL DEFAULT 3 CHECK (max_attempts > 0),
+
+    -- Scheduling and worker lease fields preventing concurrent double-claims.
     next_run_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     locked_by TEXT,
     locked_until TIMESTAMPTZ,
+
+    -- Failure diagnostics and DLQ replay metadata inspected in the Workbench UI.
     last_error_code TEXT,
     last_error_message TEXT,
     replay_count INT NOT NULL DEFAULT 0 CHECK (replay_count >= 0),
@@ -130,17 +150,21 @@ CREATE TABLE ingestion_jobs (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- Deduplicate HTTP retries carrying the same Idempotency-Key header.
 CREATE UNIQUE INDEX uidx_ingestion_jobs_idempotency
     ON ingestion_jobs (idempotency_key) WHERE idempotency_key IS NOT NULL;
 
+-- Covering partial index for the worker's FOR UPDATE SKIP LOCKED claim query.
 CREATE INDEX idx_ingestion_jobs_claim
     ON ingestion_jobs (next_run_at ASC, created_at ASC)
     WHERE status IN ('PENDING', 'RETRY_WAIT');
 
+-- Partial index for future stale-lease recovery sweeps on crashed workers.
 CREATE INDEX idx_ingestion_jobs_stale_lease
     ON ingestion_jobs (locked_until ASC)
     WHERE status = 'PROCESSING';
 
+-- Partial index supporting DLQ inspection ordered by most recent failures.
 CREATE INDEX idx_ingestion_jobs_dlq
     ON ingestion_jobs (updated_at DESC)
     WHERE status = 'DEAD_LETTER';
@@ -150,7 +174,8 @@ CREATE INDEX idx_ingestion_jobs_dlq
 -- Table: ledger_transactions
 --
 -- Atomic financial events per Financial Account. Intentionally omits
--- canonical_user_id (ADR-0003) so Entity Merges never rewrite historical rows.
+-- canonical_user_id (ADR-0003) so Entity Merges only reassign accounts without
+-- rewriting historical ledger rows.
 -- -----------------------------------------------------------------------------
 CREATE TABLE ledger_transactions (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -168,21 +193,26 @@ CREATE TABLE ledger_transactions (
     raw_metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 
+    -- Deterministic per-account deduplication across overlapping statement windows.
     CONSTRAINT ledger_txns_account_idempotency_unique UNIQUE (account_id, idempotency_key)
 );
 
+-- Supports paginated transaction history ordered newest-first per account.
 CREATE INDEX idx_ledger_txns_account_time
     ON ledger_transactions (account_id, txn_timestamp DESC);
 
+-- Partial index powering the Review queue of UNCATEGORIZED_REVIEW transactions.
 CREATE INDEX idx_ledger_txns_uncategorized
     ON ledger_transactions (created_at DESC)
     WHERE category = 'UNCATEGORIZED_REVIEW';
 
+-- Supports category-filtered spend/income queries.
 CREATE INDEX idx_ledger_txns_category
     ON ledger_transactions (category, txn_timestamp DESC)
     WHERE category IS NOT NULL;
 
--- Block DELETE and allow UPDATE solely on (category, category_updated_at).
+-- Immutability guard for ledger_transactions: blocks all DELETE operations and
+-- rejects any UPDATE that modifies columns other than (category, category_updated_at).
 CREATE OR REPLACE FUNCTION fn_ledger_transactions_immutable()
 RETURNS TRIGGER
 LANGUAGE plpgsql
@@ -192,6 +222,7 @@ BEGIN
         RAISE EXCEPTION 'ledger_transactions rows are immutable and cannot be deleted';
     END IF;
 
+    -- Check every immutable column with IS DISTINCT FROM so NULL-to-NULL remains unchanged.
     IF NEW.id IS DISTINCT FROM OLD.id
         OR NEW.account_id IS DISTINCT FROM OLD.account_id
         OR NEW.ingestion_job_id IS DISTINCT FROM OLD.ingestion_job_id
@@ -233,9 +264,13 @@ CREATE TABLE ledger_entries (
     units NUMERIC(18,6),
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 
+    -- Allow zero-cash unit-only Corporate Actions / Costless Anchors when units <> 0,
+    -- while forbidding completely empty zero-amount, zero-unit entries.
     CONSTRAINT ledger_entries_nonzero_check CHECK (
         amount <> 0 OR (units IS NOT NULL AND units <> 0)
     ),
+
+    -- Restrict unit tracking strictly to investment cost buckets.
     CONSTRAINT ledger_entries_units_coa_check CHECK (
         units IS NULL OR coa_account IN ('ASSET:MF_COST', 'ASSET:EQUITY_COST')
     )
@@ -246,10 +281,12 @@ CREATE INDEX idx_ledger_entries_account_coa_cov
     ON ledger_entries (account_id, coa_account)
     INCLUDE (amount, units);
 
+-- Supports transaction-to-entries drilldown lookups.
 CREATE INDEX idx_ledger_entries_txn
     ON ledger_entries (transaction_id);
 
 -- Strict append-only immutability trigger blocking UPDATE and DELETE on ledger_entries.
+-- Corrections must be posted as compensating Ledger Transactions rather than edits.
 CREATE OR REPLACE FUNCTION fn_ledger_entries_immutable()
 RETURNS TRIGGER
 LANGUAGE plpgsql
@@ -264,7 +301,8 @@ CREATE TRIGGER trg_ledger_entries_immutable
     FOR EACH ROW
     EXECUTE FUNCTION fn_ledger_entries_immutable();
 
--- Deferred zero-sum and account-ownership consistency trigger per transaction_id.
+-- Deferred zero-sum and account-ownership consistency trigger evaluated per transaction_id
+-- at COMMIT time so multi-leg inserts can complete within the transaction before checking.
 CREATE OR REPLACE FUNCTION fn_ledger_entries_check_balanced()
 RETURNS TRIGGER
 LANGUAGE plpgsql
@@ -279,6 +317,8 @@ BEGIN
     ELSE
         target_txn_id := NEW.transaction_id;
 
+        -- Ensure every Ledger Entry belongs to the same Financial Account as its parent
+        -- Ledger Transaction so cross-account entries cannot corrupt per-account sums.
         SELECT lt.account_id INTO tx_account_id
         FROM ledger_transactions lt
         WHERE lt.id = NEW.transaction_id;
@@ -289,6 +329,8 @@ BEGIN
         END IF;
     END IF;
 
+    -- Verify double-entry conservation: all signed monetary legs of the transaction
+    -- must sum to exactly zero before PostgreSQL allows COMMIT to succeed.
     SELECT COALESCE(SUM(le.amount), 0) INTO entry_sum
     FROM ledger_entries le
     WHERE le.transaction_id = target_txn_id;

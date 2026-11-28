@@ -155,10 +155,10 @@ func TestUsersAndLinkedIdentitiesConstraints(t *testing.T) {
 	}
 }
 
-// TestLedgerSchemaAndTriggers exercises 0002_ledger_and_jobs.sql:
-//   - 13-bucket coa_account and 17-value canonical_category enums
-//   - accounts, ingestion_jobs, ledger_transactions (no canonical_user_id), ledger_entries
-//   - covering index idx_ledger_entries_account_coa_cov
+// TestLedgerSchemaAndTriggers exercises 0002_ledger_and_jobs.sql end-to-end:
+//   - 13-bucket coa_account and 17-value canonical_category enum definitions
+//   - accounts, ingestion_jobs, ledger_transactions (omitting canonical_user_id), ledger_entries
+//   - covering index idx_ledger_entries_account_coa_cov for index-only balance sums
 //   - DEFERRABLE INITIALLY DEFERRED SUM(amount) = 0 trigger & account_id consistency
 //   - append-only triggers on ledger_entries and restricted category-only updates on ledger_transactions
 func TestLedgerSchemaAndTriggers(t *testing.T) {
@@ -170,7 +170,7 @@ func TestLedgerSchemaAndTriggers(t *testing.T) {
 		t.Fatalf("Migrate: %v", err)
 	}
 
-	// Verify coa_account has 13 values and canonical_category has 17 values.
+	// Step 1: Verify Chart of Accounts (13 buckets) and Canonical Category (17 values) enums.
 	var coaCount, catCount int
 	if err := pool.QueryRow(ctx, `SELECT array_length(enum_range(NULL::coa_account), 1)`).Scan(&coaCount); err != nil {
 		t.Fatalf("query coa_account enum length: %v", err)
@@ -185,7 +185,8 @@ func TestLedgerSchemaAndTriggers(t *testing.T) {
 		t.Fatalf("expected 17 canonical_category values, got %d", catCount)
 	}
 
-	// Verify ledger_transactions intentionally omits canonical_user_id (ADR-0003).
+	// Step 2: Confirm ledger_transactions omits canonical_user_id per ADR-0003 so Entity Merges
+	// only reassign Financial Accounts without rewriting historical ledger rows.
 	var hasCanonicalUserCol bool
 	if err := pool.QueryRow(ctx, `
 		SELECT EXISTS (
@@ -200,7 +201,8 @@ func TestLedgerSchemaAndTriggers(t *testing.T) {
 		t.Fatalf("ledger_transactions must omit canonical_user_id per ADR-0003")
 	}
 
-	// Verify covering index for zero-heap-fetch balance aggregation exists.
+	// Step 3: Verify the covering index (account_id, coa_account) INCLUDE (amount, units) exists
+	// so live balance queries can run as index-only scans.
 	var hasCovIndex bool
 	if err := pool.QueryRow(ctx, `
 		SELECT EXISTS (
@@ -215,7 +217,8 @@ func TestLedgerSchemaAndTriggers(t *testing.T) {
 		t.Fatalf("expected idx_ledger_entries_account_coa_cov to exist on ledger_entries")
 	}
 
-	// Seed a user, account, and job to test ledger triggers.
+	// Step 4: Seed a Canonical User, two Financial Accounts, and an ingestion_jobs row
+	// to exercise double-entry triggers and account-ownership checks.
 	var userID, accountID, otherAccountID, jobID string
 	if err := pool.QueryRow(ctx,
 		`INSERT INTO users (persona_slug, display_name) VALUES ('aarav', 'Aarav') RETURNING id`,
@@ -244,7 +247,7 @@ func TestLedgerSchemaAndTriggers(t *testing.T) {
 		t.Fatalf("insert job: %v", err)
 	}
 
-	// Case 1: Balanced zero-sum double-entry transaction commits cleanly.
+	// Case 1: Balanced zero-sum double-entry transaction (+50000 ASSET:BANK, -50000 External Clearing) commits cleanly.
 	tx, err := pool.Begin(ctx)
 	if err != nil {
 		t.Fatalf("begin tx: %v", err)
@@ -268,7 +271,8 @@ func TestLedgerSchemaAndTriggers(t *testing.T) {
 		t.Fatalf("commit balanced tx: %v", err)
 	}
 
-	// Case 2: Unbalanced transaction must fail on COMMIT due to DEFERRABLE INITIALLY DEFERRED trigger.
+	// Case 2: Unbalanced transaction (-100 + 90 != 0) inserts inside the tx block
+	// and fails at COMMIT when the DEFERRABLE INITIALLY DEFERRED trigger fires.
 	txBad, err := pool.Begin(ctx)
 	if err != nil {
 		t.Fatalf("begin unbalanced tx: %v", err)
@@ -292,7 +296,8 @@ func TestLedgerSchemaAndTriggers(t *testing.T) {
 		t.Fatalf("expected COMMIT to fail for unbalanced ledger_entries")
 	}
 
-	// Case 3: Mismatched account_id between ledger_entries and ledger_transactions must fail on COMMIT.
+	// Case 3: Even when SUM(amount) = 0, pointing an entry at a different Financial Account
+	// than its parent Ledger Transaction must fail at COMMIT.
 	txMismatch, err := pool.Begin(ctx)
 	if err != nil {
 		t.Fatalf("begin mismatch tx: %v", err)
@@ -316,7 +321,7 @@ func TestLedgerSchemaAndTriggers(t *testing.T) {
 		t.Fatalf("expected COMMIT to fail when ledger_entries.account_id differs from ledger_transactions.account_id")
 	}
 
-	// Case 4: ledger_entries blocks UPDATE and DELETE.
+	// Case 4: Strict append-only guard blocks both UPDATE and DELETE on ledger_entries.
 	if _, err := pool.Exec(ctx, `UPDATE ledger_entries SET amount = 0.0001 WHERE transaction_id = $1`, txnID); err == nil {
 		t.Fatalf("expected UPDATE on ledger_entries to be blocked")
 	}
@@ -324,7 +329,8 @@ func TestLedgerSchemaAndTriggers(t *testing.T) {
 		t.Fatalf("expected DELETE on ledger_entries to be blocked")
 	}
 
-	// Case 5: ledger_transactions blocks DELETE and non-category UPDATE, but allows (category, category_updated_at) UPDATE.
+	// Case 5: ledger_transactions blocks DELETE and narration edits, while allowing
+	// analytical reclassification updates solely to (category, category_updated_at).
 	if _, err := pool.Exec(ctx, `DELETE FROM ledger_transactions WHERE id = $1`, txnID); err == nil {
 		t.Fatalf("expected DELETE on ledger_transactions to be blocked")
 	}
