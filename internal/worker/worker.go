@@ -16,6 +16,7 @@ import (
 
 	"github.com/Adhish78/ReconcileX/internal/aa"
 	"github.com/Adhish78/ReconcileX/internal/cas"
+	"github.com/Adhish78/ReconcileX/internal/liability"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -37,6 +38,7 @@ const (
 
 	errCodeSchemaValidation     = "ERR_SCHEMA_VALIDATION"
 	errCodeUnitChecksum         = "ERR_UNIT_CHECKSUM"
+	errCodeInvalidEMISplit      = "ERR_INVALID_EMI_SPLIT"
 	errCodeBackfillBeforeAnchor = "ERR_BACKFILL_BEFORE_ANCHOR"
 	errCodeTransientFault       = "ERR_TRANSIENT_FAULT"
 )
@@ -265,6 +267,22 @@ func (p *Pool) ProcessOne(ctx context.Context, workerID string) (bool, error) {
 			return true, p.handleProcessingError(ctx, job.ID, workerID, err)
 		}
 
+	case "LIABILITY":
+		// Parse and validate internal LIABILITY v1.0.0 payloads and EMI component splits
+		// before opening a ledger write transaction.
+		parsed, err := liability.Parse(job.Payload)
+		if err != nil {
+			return true, p.handleProcessingError(ctx, job.ID, workerID, err)
+		}
+
+		// Post Liability Account upsert, Opening Anchor, split EMI/loan legs, and completion atomically.
+		if err := p.postLoanAndComplete(ctx, job, workerID, parsed); err != nil {
+			if errors.Is(err, ErrLeaseLost) {
+				return true, err
+			}
+			return true, p.handleProcessingError(ctx, job.ID, workerID, err)
+		}
+
 	default:
 		// Unimplemented or unknown source types fail permanently to DEAD_LETTER so they
 		// do not spin in PENDING.
@@ -280,11 +298,14 @@ func (p *Pool) ProcessOne(ctx context.Context, workerID string) (bool, error) {
 // DEAD_LETTER and treats all other processing errors as transient faults subject
 // to exponential RETRY_WAIT backoff up to max_attempts.
 func (p *Pool) handleProcessingError(ctx context.Context, jobID, workerID string, procErr error) error {
-	if errors.Is(procErr, aa.ErrSchemaValidation) || errors.Is(procErr, cas.ErrSchemaValidation) {
+	if errors.Is(procErr, aa.ErrSchemaValidation) || errors.Is(procErr, cas.ErrSchemaValidation) || errors.Is(procErr, liability.ErrSchemaValidation) {
 		return p.markDeadLetter(ctx, jobID, workerID, errCodeSchemaValidation, procErr.Error())
 	}
 	if errors.Is(procErr, cas.ErrUnitChecksum) {
 		return p.markDeadLetter(ctx, jobID, workerID, errCodeUnitChecksum, procErr.Error())
+	}
+	if errors.Is(procErr, liability.ErrInvalidEMISplit) {
+		return p.markDeadLetter(ctx, jobID, workerID, errCodeInvalidEMISplit, procErr.Error())
 	}
 	if errors.Is(procErr, ErrBackfillBeforeAnchor) {
 		return p.markDeadLetter(ctx, jobID, workerID, errCodeBackfillBeforeAnchor, procErr.Error())
