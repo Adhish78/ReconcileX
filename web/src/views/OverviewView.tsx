@@ -27,6 +27,8 @@ export function OverviewView({ persona }: PersonaViewProps) {
   const [txnLoading, setTxnLoading] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
 
+  // Reload portfolio summary and Financial Accounts whenever the active Persona changes,
+  // clearing any prior transaction drilldown so stale rows from another user never flash.
   useEffect(() => {
     if (!persona) {
       setSummary(null);
@@ -36,6 +38,7 @@ export function OverviewView({ persona }: PersonaViewProps) {
       return;
     }
 
+    // Cancellation flag prevents out-of-order Persona switches from overwriting newer state.
     let cancelled = false;
     setLoading(true);
     setSelectedAccountId(null);
@@ -64,6 +67,7 @@ export function OverviewView({ persona }: PersonaViewProps) {
     };
   }, [persona]);
 
+  // Fetches double-entry Ledger Transactions and nested Ledger Entries for one account.
   async function handleInspectTransactions(accountId: string) {
     setSelectedAccountId(accountId);
     setTxnLoading(true);
@@ -92,12 +96,14 @@ export function OverviewView({ persona }: PersonaViewProps) {
           : "No active Canonical Users seeded yet."}
       </p>
 
+      {/* Surface API or transaction drilldown failures inline without clearing loaded cards */}
       {error && (
         <div role="alert" className="error-banner">
           {error}
         </div>
       )}
 
+      {/* Top-level Net Worth and operational counts aggregated from ledger_entries */}
       {summary && (
         <div className="metrics-grid section-gap">
           <div className="metric-box">
@@ -119,6 +125,7 @@ export function OverviewView({ persona }: PersonaViewProps) {
         </div>
       )}
 
+      {/* Financial Accounts table comparing read-time ledger balances with reported snapshots */}
       {persona && (
         <div className="section-gap">
           <h3>Financial Accounts</h3>
@@ -167,6 +174,7 @@ export function OverviewView({ persona }: PersonaViewProps) {
         </div>
       )}
 
+      {/* Inline transaction drilldown revealing every zero-sum Chart of Accounts entry leg */}
       {selectedAccount && (
         <div className="drilldown-panel section-gap">
           <h3>

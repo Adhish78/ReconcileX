@@ -29,6 +29,10 @@ async function parseErrorMessage(res: Response): Promise<string> {
   return `HTTP ${res.status} ${res.statusText}`;
 }
 
+/**
+ * Shared fetch wrapper that validates HTTP status, surfaces backend API error
+ * envelopes via parseErrorMessage, and parses the JSON body as T.
+ */
 async function fetchJSON<T>(url: string): Promise<T> {
   const res = await fetch(url);
   if (!res.ok) {
@@ -104,20 +108,22 @@ export async function fetchJobs(personaSlug = "", status = ""): Promise<JobSumma
 
 /**
  * Formats a fixed-point decimal string (e.g. "48500.0000" or "-1500.2500")
- * using Indian numbering grouping without float conversion on large integers.
+ * using Indian numbering grouping (lakhs/crores) directly on string digits so
+ * large integers never lose precision in JS IEEE-754 numbers.
  */
 export function formatINR(decimalStr: string | null | undefined): string {
   if (!decimalStr) {
     return "₹0.00";
   }
 
+  // Separate sign, whole digits, and fractional digits without Number() conversion.
   const trimmed = decimalStr.trim();
   const neg = trimmed.startsWith("-");
   const unsigned = neg ? trimmed.slice(1) : trimmed;
   const [intRaw, fracRaw = ""] = unsigned.split(".");
   const intDigits = intRaw.replace(/^0+(?=\d)/, "") || "0";
 
-  // Indian numbering system: last 3 digits, then groups of 2.
+  // Indian numbering system: keep the rightmost 3 digits together, then group preceding pairs.
   let grouped = intDigits;
   if (intDigits.length > 3) {
     const tail = intDigits.slice(-3);
@@ -125,6 +131,7 @@ export function formatINR(decimalStr: string | null | undefined): string {
     grouped = `${head},${tail}`;
   }
 
+  // Display 2 fractional digits (paise) while preserving trailing-zero padding.
   const fracTwo = (fracRaw + "00").slice(0, 2);
   return `${neg ? "-" : ""}₹${grouped}.${fracTwo}`;
 }

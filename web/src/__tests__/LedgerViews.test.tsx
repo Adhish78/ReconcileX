@@ -1,12 +1,15 @@
 /**
- * Component tests for Overview Financial Account balances, transaction drilldown,
- * and Reconciliation Workbench job queue views (Issue #14).
+ * Component integration tests for the Issue #14 UI views rendered inside <App />:
+ *   - Overview Financial Account balances, Indian INR formatting, and double-entry
+ *     transaction drilldowns
+ *   - Reconciliation Workbench ingestion_jobs queue and DLQ error code rendering
  */
 import { act } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import App from "../App";
 import { renderIntoDocument, type RenderHandle, waitForCondition } from "../testUtils";
 
+// Builds a synthetic JSON Response for stubbed globalThis.fetch handlers.
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
     status,
@@ -17,6 +20,7 @@ function jsonResponse(body: unknown, status = 200): Response {
 describe("Overview Accounts, Transaction Drilldown, and Workbench Jobs", () => {
   let handle: RenderHandle | null = null;
 
+  // Unmount the React root and restore fetch spies after each test so DOM state stays isolated.
   afterEach(async () => {
     if (handle) {
       await handle.unmount();
@@ -26,6 +30,7 @@ describe("Overview Accounts, Transaction Drilldown, and Workbench Jobs", () => {
   });
 
   it("displays Financial Account balances and transaction drilldown on Overview", async () => {
+    // Stub persona, portfolio summary, account listing, and transaction drilldown endpoints.
     vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
       const url = typeof input === "string" ? input : input.toString();
 
@@ -106,12 +111,14 @@ describe("Overview Accounts, Transaction Drilldown, and Workbench Jobs", () => {
     handle = await renderIntoDocument(<App />);
     const root = handle.container;
 
+    // Wait for initial Overview load to render the HDFC account row and formatted INR balance.
     await waitForCondition(() => {
       expect(root.textContent).toContain("HDFC Bank");
       expect(root.textContent).toContain("XXXXXXXX4020");
       expect(root.textContent).toContain("48,500.00");
     });
 
+    // Trigger the inline transaction drilldown and assert both double-entry legs appear.
     const inspectBtn = Array.from(root.querySelectorAll("button")).find((b) =>
       b.textContent?.includes("Inspect Transactions")
     );
@@ -129,6 +136,8 @@ describe("Overview Accounts, Transaction Drilldown, and Workbench Jobs", () => {
   });
 
   it("displays the ingestion_jobs queue and error codes in Reconciliation Workbench", async () => {
+    // Stub persona, Overview background fetches, and a persona-scoped /api/v1/jobs response
+    // containing both a COMPLETED job and a DEAD_LETTER job.
     const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
       const url = typeof input === "string" ? input : input.toString();
 
@@ -206,6 +215,7 @@ describe("Overview Accounts, Transaction Drilldown, and Workbench Jobs", () => {
     handle = await renderIntoDocument(<App />);
     const root = handle.container;
 
+    // Switch to the Reconciliation Workbench tab and assert jobs and DLQ codes load for Aarav.
     const workbenchBtn = Array.from(root.querySelectorAll("button")).find((b) =>
       b.textContent?.includes("Reconciliation Workbench")
     );

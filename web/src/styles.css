@@ -187,6 +187,7 @@ body {
   font-weight: 600;
 }
 
+/* Vertical spacing and header/toolbar layout shared across Overview and Workbench */
 .section-gap {
   margin-top: 1.25rem;
 }
@@ -205,6 +206,12 @@ body {
   align-items: center;
 }
 
+
+/* =============================================================================
+ * Data Tables, Drilldown Panels & Ledger Entry Pills
+ * ============================================================================= */
+
+/* Horizontal scroll wrapper protecting narrow viewports from wide ledger tables */
 .table-wrap {
   overflow-x: auto;
 }
@@ -231,10 +238,12 @@ body {
   letter-spacing: 0.04em;
 }
 
+/* Highlights the Financial Account currently opened in the transaction drilldown */
 .data-table tr.is-selected {
   background: #13213c;
 }
 
+/* Monospace styling for fixed-point INR amounts, timestamps, and UUIDs */
 .mono {
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
   font-size: 0.82rem;
@@ -255,6 +264,7 @@ body {
   color: #f8fafc;
 }
 
+/* Recessed container displaying double-entry Ledger Transactions for one account */
 .drilldown-panel {
   background: #0b1222;
   border: 1px solid #1e293b;
@@ -275,6 +285,12 @@ body {
   padding: 0.15rem 0.45rem;
 }
 
+
+/* =============================================================================
+ * Ingestion Job Status Badges
+ * ============================================================================= */
+
+/* Pill badge base and semantic state colors matching PostgreSQL job_status values */
 .status-badge {
   display: inline-block;
   padding: 0.15rem 0.5rem;

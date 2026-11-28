@@ -2,13 +2,14 @@ import { useCallback, useEffect, useState } from "react";
 import { fetchJobs } from "../api";
 import type { JobSummary, PersonaViewProps } from "../types";
 
+// Valid job_status enum values plus "" for unfiltered queue inspection.
 const JOB_STATUS_FILTERS = ["", "PENDING", "PROCESSING", "RETRY_WAIT", "COMPLETED", "DEAD_LETTER"];
 
 /**
  * "Reconciliation Workbench" tab panel rendered inside App.
  *
- * Displays the asynchronous ingestion_jobs SKIP LOCKED queue with status filtering
- * and failure diagnostics.
+ * Displays the asynchronous ingestion_jobs SKIP LOCKED queue with status filtering,
+ * manual refresh, and dead-letter failure diagnostics.
  */
 export function ReconciliationView({ persona }: PersonaViewProps) {
   const [jobs, setJobs] = useState<JobSummary[]>([]);
@@ -16,8 +17,10 @@ export function ReconciliationView({ persona }: PersonaViewProps) {
   const [loading, setLoading] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
 
+  // Empty slug queries all jobs when no Persona is selected; otherwise scopes to the active Persona.
   const personaSlug = persona?.persona_slug ?? "";
 
+  // Memoized loader shared by the reactive effect and the manual "Refresh Queue" button.
   const loadJobs = useCallback(async (slug: string, status: string) => {
     setLoading(true);
     try {
@@ -31,12 +34,14 @@ export function ReconciliationView({ persona }: PersonaViewProps) {
     }
   }, []);
 
+  // Refresh the queue automatically whenever the active Persona or status filter changes.
   useEffect(() => {
     void loadJobs(personaSlug, statusFilter);
   }, [loadJobs, personaSlug, statusFilter]);
 
   return (
     <section className="card">
+      {/* Header with status filter dropdown and on-demand queue refresh button */}
       <div className="section-header">
         <div>
           <h2>Reconciliation Workbench</h2>
@@ -77,6 +82,7 @@ export function ReconciliationView({ persona }: PersonaViewProps) {
         </div>
       )}
 
+      {/* Ingestion queue table highlighting job status badges and DLQ error diagnostics */}
       <h3>Ingestion Jobs Queue</h3>
       {loading ? (
         <p className="muted">Loading jobs...</p>

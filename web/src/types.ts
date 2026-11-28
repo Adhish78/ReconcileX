@@ -1,6 +1,6 @@
 /**
  * Shared TypeScript contracts mirroring the Go HTTP API payloads and UI shell state.
- * Kept in sync with internal/api/server.go.
+ * Kept in sync with internal/api/server.go, ingest.go, and ledger_views.go.
  */
 
 /**
@@ -38,6 +38,10 @@ export interface PersonaViewProps {
   persona: Persona | null;
 }
 
+/**
+ * Reconcilable Financial Account returned by GET /api/v1/accounts.
+ * Decimal strings remain unparsed to preserve fixed-point NUMERIC(18,4) precision.
+ */
 export interface AccountSummary {
   id: string;
   canonical_user_id: string;
@@ -54,6 +58,9 @@ export interface AccountSummary {
   open_alert_count: number;
 }
 
+/**
+ * Single immutable Chart of Accounts leg belonging to a Ledger Transaction.
+ */
 export interface LedgerEntryItem {
   id: string;
   coa_account: string;
@@ -61,6 +68,10 @@ export interface LedgerEntryItem {
   units: string | null;
 }
 
+/**
+ * Zero-sum Ledger Transaction with nested Ledger Entries returned by
+ * GET /api/v1/accounts/{id}/transactions.
+ */
 export interface LedgerTransactionItem {
   id: string;
   account_id: string;
@@ -75,6 +86,10 @@ export interface LedgerTransactionItem {
   entries: LedgerEntryItem[];
 }
 
+/**
+ * Persona-scoped Net Worth and operational summary returned by
+ * GET /api/v1/portfolio/summary.
+ */
 export interface PortfolioSummary {
   persona: {
     id: string;
@@ -98,6 +113,9 @@ export interface PortfolioSummary {
   dlq_job_count: number;
 }
 
+/**
+ * Asynchronous SKIP LOCKED queue row returned by GET /api/v1/jobs.
+ */
 export interface JobSummary {
   id: string;
   canonical_user_id: string | null;
