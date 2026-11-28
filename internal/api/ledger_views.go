@@ -8,8 +8,10 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -21,27 +23,41 @@ import (
 // Response models
 // -----------------------------------------------------------------------------
 
+// EquityHoldingSummary represents one per-ISIN equity holding inside an EQUITY
+// demat Financial Account, combining live ASSET:EQUITY_COST ledger aggregates
+// with reported snapshot metadata.
+type EquityHoldingSummary struct {
+	ISIN            string  `json:"isin"`
+	IssuerName      string  `json:"issuer_name"`
+	ISINDescription string  `json:"isin_description"`
+	CostBasis       string  `json:"cost_basis"`
+	LedgerUnits     string  `json:"ledger_units"`
+	ReportedUnits   *string `json:"reported_units"`
+	LastTradedPrice *string `json:"last_traded_price"`
+}
+
 // AccountSummary represents a Financial Account with its live aggregated ledger balance.
 type AccountSummary struct {
-	ID                string     `json:"id"`
-	CanonicalUserID   string     `json:"canonical_user_id"`
-	SourceType        string     `json:"source_type"`
-	NaturalKey        string     `json:"natural_key"`
-	InstitutionName   string     `json:"institution_name"`
-	FipID             string     `json:"fip_id"`
-	LinkedAccRef      string     `json:"linked_acc_ref"`
-	MaskedAccNumber   string     `json:"masked_acc_number"`
-	FolioNumber       string     `json:"folio_number"`
-	ISIN              string     `json:"isin"`
-	SchemeCode        *int       `json:"scheme_code"`
-	SchemeName        string     `json:"scheme_name"`
-	Currency          string     `json:"currency"`
-	LedgerBalance     string     `json:"ledger_balance"`
-	LedgerUnits       *string    `json:"ledger_units"`
-	ReportedBalance   *string    `json:"reported_balance"`
-	ReportedUnits     *string    `json:"reported_units"`
-	ReportedBalanceAt *time.Time `json:"reported_balance_at"`
-	OpenAlertCount    int        `json:"open_alert_count"`
+	ID                string                 `json:"id"`
+	CanonicalUserID   string                 `json:"canonical_user_id"`
+	SourceType        string                 `json:"source_type"`
+	NaturalKey        string                 `json:"natural_key"`
+	InstitutionName   string                 `json:"institution_name"`
+	FipID             string                 `json:"fip_id"`
+	LinkedAccRef      string                 `json:"linked_acc_ref"`
+	MaskedAccNumber   string                 `json:"masked_acc_number"`
+	FolioNumber       string                 `json:"folio_number"`
+	ISIN              string                 `json:"isin"`
+	SchemeCode        *int                   `json:"scheme_code"`
+	SchemeName        string                 `json:"scheme_name"`
+	Currency          string                 `json:"currency"`
+	LedgerBalance     string                 `json:"ledger_balance"`
+	LedgerUnits       *string                `json:"ledger_units"`
+	ReportedBalance   *string                `json:"reported_balance"`
+	ReportedUnits     *string                `json:"reported_units"`
+	ReportedBalanceAt *time.Time             `json:"reported_balance_at"`
+	OpenAlertCount    int                    `json:"open_alert_count"`
+	EquityHoldings    []EquityHoldingSummary `json:"equity_holdings,omitempty"`
 }
 
 // LedgerEntryItem represents a single immutable Chart of Accounts leg returned
@@ -195,11 +211,16 @@ func (s *server) handleGetAccounts(w http.ResponseWriter, r *http.Request) {
 					COALESCE(SUM(le.units) FILTER (
 						WHERE le.coa_account = 'ASSET:MF_COST'
 					), 0)::NUMERIC(18,6)::text
+				WHEN a.source_type = 'EQUITY' THEN
+					COALESCE(SUM(le.units) FILTER (
+						WHERE le.coa_account = 'ASSET:EQUITY_COST'
+					), 0)::NUMERIC(18,6)::text
 				ELSE NULL
 			END AS ledger_units,
 			a.reported_balance::text,
 			a.reported_units::text,
-			a.reported_balance_at
+			a.reported_balance_at,
+			COALESCE(a.metadata->'holdings', '{}'::jsonb)
 		FROM accounts a
 		LEFT JOIN ledger_entries le ON le.account_id = a.id
 		WHERE a.canonical_user_id = $1
@@ -213,16 +234,32 @@ func (s *server) handleGetAccounts(w http.ResponseWriter, r *http.Request) {
 	defer rows.Close()
 
 	accounts := make([]AccountSummary, 0)
+	equityIndices := make(map[string]int)
+	equityIDs := make([]string, 0)
+	holdingsMetaByAcct := make(map[string]map[string]storedEquityHoldingMeta)
+
 	for rows.Next() {
 		var a AccountSummary
+		var holdingsRaw []byte
 		if err := rows.Scan(
 			&a.ID, &a.CanonicalUserID, &a.SourceType, &a.NaturalKey,
 			&a.InstitutionName, &a.FipID, &a.LinkedAccRef, &a.MaskedAccNumber,
 			&a.FolioNumber, &a.ISIN, &a.SchemeCode, &a.SchemeName,
 			&a.Currency, &a.LedgerBalance, &a.LedgerUnits, &a.ReportedBalance, &a.ReportedUnits, &a.ReportedBalanceAt,
+			&holdingsRaw,
 		); err != nil {
 			writeError(w, http.StatusServiceUnavailable, errCodeDBUnavailable, "failed to scan account", map[string]any{"reason": err.Error()})
 			return
+		}
+		if a.SourceType == "EQUITY" {
+			equityIndices[a.ID] = len(accounts)
+			equityIDs = append(equityIDs, a.ID)
+			if len(holdingsRaw) > 0 {
+				var parsedMeta map[string]storedEquityHoldingMeta
+				if err := json.Unmarshal(holdingsRaw, &parsedMeta); err == nil && len(parsedMeta) > 0 {
+					holdingsMetaByAcct[a.ID] = parsedMeta
+				}
+			}
 		}
 		accounts = append(accounts, a)
 	}
@@ -231,7 +268,125 @@ func (s *server) handleGetAccounts(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if len(equityIDs) > 0 {
+		if err := s.hydrateEquityHoldings(ctx, accounts, equityIndices, equityIDs, holdingsMetaByAcct); err != nil {
+			writeError(w, http.StatusServiceUnavailable, errCodeDBUnavailable, "failed to query equity holdings", map[string]any{"reason": err.Error()})
+			return
+		}
+	}
+
 	writeJSON(w, http.StatusOK, accountsListResponse{Accounts: accounts})
+}
+
+type storedEquityHoldingMeta struct {
+	ISIN            string  `json:"isin"`
+	IssuerName      string  `json:"issuer_name"`
+	ISINDescription string  `json:"isin_description"`
+	Units           string  `json:"units"`
+	LastTradedPrice *string `json:"last_traded_price"`
+}
+
+func (s *server) hydrateEquityHoldings(
+	ctx context.Context,
+	accounts []AccountSummary,
+	equityIndices map[string]int,
+	equityIDs []string,
+	holdingsMetaByAcct map[string]map[string]storedEquityHoldingMeta,
+) error {
+	rows, err := s.pool.Query(ctx, `
+		SELECT
+			lt.account_id::text,
+			lt.raw_metadata->>'isin' AS isin,
+			COALESCE(MAX(NULLIF(lt.raw_metadata->>'companyName', '')), '') AS company_name,
+			COALESCE(MAX(NULLIF(lt.raw_metadata->>'isinDescription', '')), '') AS isin_desc,
+			COALESCE(SUM(le.amount) FILTER (WHERE le.coa_account = 'ASSET:EQUITY_COST'), 0)::NUMERIC(18,4)::text AS cost_basis,
+			COALESCE(SUM(le.units) FILTER (WHERE le.coa_account = 'ASSET:EQUITY_COST'), 0)::NUMERIC(18,6)::text AS ledger_units
+		FROM ledger_transactions lt
+		JOIN ledger_entries le ON le.transaction_id = lt.id
+		WHERE lt.account_id = ANY($1::uuid[])
+		  AND lt.raw_metadata ? 'isin'
+		GROUP BY lt.account_id, lt.raw_metadata->>'isin'
+		ORDER BY lt.raw_metadata->>'isin' ASC
+	`, equityIDs)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	byAcctISIN := make(map[string]map[string]EquityHoldingSummary, len(equityIDs))
+	for rows.Next() {
+		var acctID, isin, compName, isinDesc, costBasis, ledgerUnits string
+		if err := rows.Scan(&acctID, &isin, &compName, &isinDesc, &costBasis, &ledgerUnits); err != nil {
+			return err
+		}
+		if isin == "" {
+			continue
+		}
+		if byAcctISIN[acctID] == nil {
+			byAcctISIN[acctID] = make(map[string]EquityHoldingSummary)
+		}
+		byAcctISIN[acctID][isin] = EquityHoldingSummary{
+			ISIN:            isin,
+			IssuerName:      compName,
+			ISINDescription: isinDesc,
+			CostBasis:       costBasis,
+			LedgerUnits:     ledgerUnits,
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	for acctID, idx := range equityIndices {
+		perISIN := byAcctISIN[acctID]
+		if perISIN == nil {
+			perISIN = make(map[string]EquityHoldingSummary)
+		}
+		metaMap := holdingsMetaByAcct[acctID]
+		for isin, meta := range metaMap {
+			h, exists := perISIN[isin]
+			if !exists {
+				h = EquityHoldingSummary{
+					ISIN:        isin,
+					CostBasis:   "0.0000",
+					LedgerUnits: "0.000000",
+				}
+			}
+			if meta.IssuerName != "" {
+				h.IssuerName = meta.IssuerName
+			}
+			if meta.ISINDescription != "" {
+				h.ISINDescription = meta.ISINDescription
+			}
+			if meta.Units != "" {
+				if parsedU, parseErr := money.ParseDecimal6(meta.Units); parseErr == nil {
+					uStr := parsedU.String()
+					h.ReportedUnits = &uStr
+				}
+			}
+			if meta.LastTradedPrice != nil && *meta.LastTradedPrice != "" {
+				if parsedP, parseErr := money.ParseDecimal4(*meta.LastTradedPrice); parseErr == nil {
+					pStr := parsedP.String()
+					h.LastTradedPrice = &pStr
+				}
+			}
+			perISIN[isin] = h
+		}
+
+		isins := make([]string, 0, len(perISIN))
+		for isin := range perISIN {
+			isins = append(isins, isin)
+		}
+		sort.Strings(isins)
+
+		list := make([]EquityHoldingSummary, 0, len(isins))
+		for _, isin := range isins {
+			list = append(list, perISIN[isin])
+		}
+		accounts[idx].EquityHoldings = list
+	}
+
+	return nil
 }
 
 // handleGetAccountTransactions serves GET /api/v1/accounts/{id}/transactions.
