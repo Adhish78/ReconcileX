@@ -164,3 +164,23 @@ export function formatINR(decimalStr: string | null | undefined): string {
   const fracTwo = (fracRaw + "00").slice(0, 2);
   return `${neg ? "-" : ""}₹${grouped}.${fracTwo}`;
 }
+
+/**
+ * Formats a fixed-point NUMERIC(18,6) unit string (e.g. "165.000000") to at
+ * least 4 fractional digits while preserving any non-zero 5th/6th decimal digits.
+ */
+export function formatUnits(unitsStr: string | null | undefined): string {
+  if (!unitsStr) {
+    return "0.0000";
+  }
+
+  const trimmed = unitsStr.trim();
+  const neg = trimmed.startsWith("-");
+  const unsigned = neg ? trimmed.slice(1) : trimmed;
+  const [intRaw, fracRaw = ""] = unsigned.split(".");
+  const intDigits = intRaw.replace(/^0+(?=\d)/, "") || "0";
+  const padded = (fracRaw + "000000").slice(0, 6);
+  const tailTrimmed = padded.slice(4).replace(/0+$/, "");
+  const frac = padded.slice(0, 4) + tailTrimmed;
+  return `${neg ? "-" : ""}${intDigits}.${frac}`;
+}

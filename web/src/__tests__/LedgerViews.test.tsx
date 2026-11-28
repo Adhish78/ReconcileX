@@ -546,4 +546,255 @@ describe("Overview Accounts, Transaction Drilldown, and Workbench Jobs", () => {
       expect(alert!.textContent).toContain("ERR_JOB_NOT_REPLAYABLE: only DEAD_LETTER jobs can be replayed");
     });
   });
+
+  it("displays mutual fund Folio holdings (Cost Basis and unit totals) on Overview", async () => {
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = typeof input === "string" ? input : input.toString();
+
+      if (url === "/api/v1/personas") {
+        return jsonResponse({
+          personas: [
+            { id: "u1", persona_slug: "aarav", display_name: "Aarav Sharma", linked_identity_count: 2 }
+          ]
+        });
+      }
+      if (url === "/api/v1/portfolio/summary?persona=aarav") {
+        return jsonResponse({
+          persona: { id: "u1", persona_slug: "aarav", display_name: "Aarav Sharma" },
+          as_of: "2026-06-15T14:20:10Z",
+          net_worth: "13700.0000",
+          total_assets: "13700.0000",
+          total_liabilities: "0.0000",
+          portfolio_xirr: null,
+          accounts_summary: {
+            bank_deposits: "0.0000",
+            mutual_funds: "13700.0000",
+            equities: "0.0000",
+            loans: "0.0000",
+            credit_cards: "0.0000"
+          },
+          open_alert_count: 0,
+          uncategorized_count: 0,
+          dlq_job_count: 0
+        });
+      }
+      if (url === "/api/v1/accounts?persona=aarav") {
+        return jsonResponse({
+          accounts: [
+            {
+              id: "mf-1",
+              canonical_user_id: "u1",
+              source_type: "MUTUAL_FUND",
+              natural_key: "CAMS|12345678 / 90|INF879O01027",
+              institution_name: "PPFAS Mutual Fund",
+              fip_id: "",
+              linked_acc_ref: "",
+              masked_acc_number: "",
+              folio_number: "12345678 / 90",
+              isin: "INF879O01027",
+              scheme_code: 122639,
+              scheme_name: "Parag Parikh Flexi Cap Fund - Direct Plan - Growth",
+              currency: "INR",
+              ledger_balance: "13700.0000",
+              ledger_units: "165.000000",
+              reported_balance: "14850.0000",
+              reported_units: "165.000000",
+              open_alert_count: 0
+            }
+          ]
+        });
+      }
+      if (url.startsWith("/api/v1/accounts/mf-1/transactions")) {
+        return jsonResponse({
+          account_id: "mf-1",
+          total: 1,
+          transactions: [
+            {
+              id: "txn-mf-1",
+              account_id: "mf-1",
+              source: "CAS_CAMS",
+              txn_type: "PURCHASE_SIP",
+              category: null,
+              txn_timestamp: "2024-05-05T00:00:00+05:30",
+              narration: "SIP Purchase - Inst 1",
+              reference: null,
+              idempotency_key: "k-mf-1",
+              entries: [
+                { id: "em1", coa_account: "ASSET:MF_COST", amount: "13700.0000", units: "165.000000" },
+                { id: "em2", coa_account: "EQUITY:EXTERNAL_CLEARING", amount: "-13700.0000", units: null }
+              ]
+            }
+          ]
+        });
+      }
+
+      return jsonResponse({ error: { code: "ERR_NOT_FOUND", message: "not found" } }, 404);
+    });
+
+    handle = await renderIntoDocument(<App />);
+    const root = handle.container;
+
+    await waitForCondition(() => {
+      expect(root.textContent).toContain("Mutual Fund Folio Holdings");
+      expect(root.textContent).toContain("Parag Parikh Flexi Cap Fund - Direct Plan - Growth");
+      expect(root.textContent).toContain("12345678 / 90");
+      expect(root.textContent).toContain("INF879O01027");
+      expect(root.textContent).toContain("13,700.00");
+      expect(root.textContent).toContain("165.0000");
+    });
+
+    const inspectBtn = Array.from(root.querySelectorAll("button")).find((b) =>
+      b.textContent?.includes("Inspect Transactions")
+    );
+    expect(inspectBtn).toBeDefined();
+
+    await act(async () => {
+      inspectBtn!.click();
+    });
+
+    await waitForCondition(() => {
+      expect(root.textContent).toContain("SIP Purchase - Inst 1");
+      expect(root.textContent).toContain("ASSET:MF_COST");
+      expect(root.textContent).toContain("165.0000 units");
+    });
+  });
+
+  it("repairs an ERR_UNIT_CHECKSUM CAS job in Reconciliation Workbench and replays it", async () => {
+    let replayed = false;
+    const brokenCAS = {
+      file_type: "CAMS",
+      cas_type: "DETAILED",
+      folios: [{ folio: "F1", schemes: [{ isin: "INF879O01027", open: "0.000", close: "99.000" }] }]
+    };
+
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const shell = mockWorkbenchShellRequests(url, replayed ? 0 : 1);
+      if (shell) return shell;
+
+      if (url === "/api/v1/jobs?persona=aarav") {
+        return jsonResponse({
+          total: 1,
+          jobs: [
+            {
+              id: "job-cas-dlq",
+              canonical_user_id: "u1",
+              source_type: "CAS",
+              idempotency_key: null,
+              status: replayed ? "COMPLETED" : "DEAD_LETTER",
+              attempt_count: 0,
+              max_attempts: 3,
+              replay_count: replayed ? 1 : 0,
+              last_error_code: replayed ? null : "ERR_UNIT_CHECKSUM",
+              last_error_message: replayed ? null : "unit conservation failed",
+              created_at: "2026-06-15T09:05:00Z",
+              updated_at: "2026-06-15T09:05:01Z",
+              completed_at: replayed ? "2026-06-15T09:10:01Z" : null
+            }
+          ]
+        });
+      }
+      if (url === "/api/v1/jobs/job-cas-dlq?persona=aarav" && (!init?.method || init.method === "GET")) {
+        return jsonResponse({
+          job: {
+            id: "job-cas-dlq",
+            canonical_user_id: "u1",
+            source_type: "CAS",
+            idempotency_key: null,
+            status: "DEAD_LETTER",
+            attempt_count: 0,
+            max_attempts: 3,
+            replay_count: 0,
+            last_error_code: "ERR_UNIT_CHECKSUM",
+            last_error_message: "unit conservation failed",
+            created_at: "2026-06-15T09:05:00Z",
+            updated_at: "2026-06-15T09:05:01Z",
+            completed_at: null,
+            payload: brokenCAS
+          }
+        });
+      }
+      if (url === "/api/v1/jobs/job-cas-dlq/replay?persona=aarav" && init?.method === "POST") {
+        replayed = true;
+        return jsonResponse(
+          {
+            job: {
+              id: "job-cas-dlq",
+              canonical_user_id: "u1",
+              source_type: "CAS",
+              idempotency_key: null,
+              status: "PENDING",
+              attempt_count: 0,
+              max_attempts: 3,
+              replay_count: 1,
+              last_error_code: null,
+              last_error_message: null,
+              created_at: "2026-06-15T09:05:00Z",
+              updated_at: "2026-06-15T09:10:00Z",
+              completed_at: null,
+              payload: brokenCAS
+            }
+          },
+          202
+        );
+      }
+
+      return jsonResponse({ error: { code: "ERR_NOT_FOUND", message: "not found" } }, 404);
+    });
+
+    handle = await renderIntoDocument(<App />);
+    const root = handle.container;
+
+    const workbenchBtn = Array.from(root.querySelectorAll("button")).find((b) =>
+      b.textContent?.includes("Reconciliation Workbench")
+    );
+    await act(async () => {
+      workbenchBtn!.click();
+    });
+
+    await waitForCondition(() => {
+      expect(root.textContent).toContain("ERR_UNIT_CHECKSUM");
+      expect(root.textContent).toContain("CAS");
+    });
+
+    const inspectBtn = Array.from(root.querySelectorAll("button")).find((b) =>
+      b.textContent?.includes("Inspect / Replay")
+    );
+    await act(async () => {
+      inspectBtn!.click();
+    });
+
+    let textarea: HTMLTextAreaElement | null = null;
+    await waitForCondition(() => {
+      textarea = root.querySelector<HTMLTextAreaElement>('textarea[aria-label="DLQ JSON Payload"]');
+      expect(textarea).not.toBeNull();
+      expect(textarea!.value).toContain("99.000");
+    });
+
+    const repairedCAS = JSON.stringify({
+      file_type: "CAMS",
+      cas_type: "DETAILED",
+      folios: [{ folio: "F1", schemes: [{ isin: "INF879O01027", open: "0.000", close: "50.000" }] }]
+    });
+    await act(async () => {
+      const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!;
+      setter.call(textarea, repairedCAS);
+      textarea!.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+
+    const replayBtn = Array.from(root.querySelectorAll("button")).find((b) =>
+      b.textContent?.includes("Replay Job")
+    );
+    await act(async () => {
+      replayBtn!.click();
+    });
+
+    await waitForCondition(() => {
+      const postCall = fetchSpy.mock.calls.find(
+        ([u, init]) => u === "/api/v1/jobs/job-cas-dlq/replay?persona=aarav" && init?.method === "POST"
+      );
+      expect(postCall).toBeDefined();
+      expect(root.textContent).toContain("COMPLETED");
+    });
+  });
 });

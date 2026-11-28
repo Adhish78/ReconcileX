@@ -51,9 +51,15 @@ export interface AccountSummary {
   fip_id: string;
   linked_acc_ref: string;
   masked_acc_number: string;
+  folio_number?: string;
+  isin?: string;
+  scheme_code?: number | null;
+  scheme_name?: string;
   currency: string;
   ledger_balance: string;
+  ledger_units?: string | null;
   reported_balance: string | null;
+  reported_units?: string | null;
   reported_balance_at?: string | null;
   open_alert_count: number;
 }

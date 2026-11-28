@@ -3,7 +3,8 @@ import {
   fetchAccounts,
   fetchAccountTransactions,
   fetchPortfolioSummary,
-  formatINR
+  formatINR,
+  formatUnits
 } from "../api";
 import type {
   AccountSummary,
@@ -85,6 +86,17 @@ export function OverviewView({ persona }: PersonaViewProps) {
   }
 
   const selectedAccount = accounts.find((a) => a.id === selectedAccountId) ?? null;
+  const mutualFundHoldings = accounts.filter((a) => a.source_type === "MUTUAL_FUND");
+
+  function accountIdentifier(acct: AccountSummary): string {
+    if (acct.masked_acc_number || acct.linked_acc_ref) {
+      return acct.masked_acc_number || acct.linked_acc_ref;
+    }
+    if (acct.folio_number) {
+      return acct.isin ? `${acct.folio_number} (${acct.isin})` : acct.folio_number;
+    }
+    return acct.natural_key;
+  }
 
   return (
     <section className="card">
@@ -113,6 +125,10 @@ export function OverviewView({ persona }: PersonaViewProps) {
           <div className="metric-box">
             <span className="metric-label">Bank Deposits</span>
             <span className="metric-value">{formatINR(summary.accounts_summary.bank_deposits)}</span>
+          </div>
+          <div className="metric-box">
+            <span className="metric-label">Mutual Funds (Cost Basis)</span>
+            <span className="metric-value">{formatINR(summary.accounts_summary.mutual_funds)}</span>
           </div>
           <div className="metric-box">
             <span className="metric-label">Total Liabilities</span>
@@ -151,7 +167,7 @@ export function OverviewView({ persona }: PersonaViewProps) {
                     <tr key={acct.id} className={acct.id === selectedAccountId ? "is-selected" : ""}>
                       <td>{acct.institution_name}</td>
                       <td>{acct.source_type}</td>
-                      <td className="mono">{acct.masked_acc_number || acct.linked_acc_ref}</td>
+                      <td className="mono">{accountIdentifier(acct)}</td>
                       <td className="mono">{formatINR(acct.ledger_balance)}</td>
                       <td className="mono">
                         {acct.reported_balance ? formatINR(acct.reported_balance) : "—"}
@@ -174,12 +190,57 @@ export function OverviewView({ persona }: PersonaViewProps) {
         </div>
       )}
 
+      {/* Mutual Fund Folio Holdings table highlighting Cost Basis and unit totals */}
+      {persona && mutualFundHoldings.length > 0 && (
+        <div className="section-gap">
+          <h3>Mutual Fund Folio Holdings</h3>
+          <div className="table-wrap">
+            <table className="data-table">
+              <thead>
+                <tr>
+                  <th>Scheme</th>
+                  <th>Folio</th>
+                  <th>ISIN</th>
+                  <th>Cost Basis</th>
+                  <th>Ledger Units</th>
+                  <th>Reported Units</th>
+                  <th>Reported Value</th>
+                  <th>Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {mutualFundHoldings.map((mf) => (
+                  <tr key={mf.id} className={mf.id === selectedAccountId ? "is-selected" : ""}>
+                    <td>{mf.scheme_name || mf.institution_name}</td>
+                    <td className="mono">{mf.folio_number || "—"}</td>
+                    <td className="mono">{mf.isin || "—"}</td>
+                    <td className="mono">{formatINR(mf.ledger_balance)}</td>
+                    <td className="mono">{formatUnits(mf.ledger_units)}</td>
+                    <td className="mono">{mf.reported_units ? formatUnits(mf.reported_units) : "—"}</td>
+                    <td className="mono">{mf.reported_balance ? formatINR(mf.reported_balance) : "—"}</td>
+                    <td>
+                      <button
+                        type="button"
+                        className="btn-secondary"
+                        onClick={() => void handleInspectTransactions(mf.id)}
+                      >
+                        Inspect Transactions
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
       {/* Inline transaction drilldown revealing every zero-sum Chart of Accounts entry leg */}
       {selectedAccount && (
         <div className="drilldown-panel section-gap">
           <h3>
             Ledger Transactions — {selectedAccount.institution_name} (
-            {selectedAccount.masked_acc_number || selectedAccount.linked_acc_ref})
+            {accountIdentifier(selectedAccount)})
           </h3>
 
           {txnLoading ? (
@@ -208,6 +269,7 @@ export function OverviewView({ persona }: PersonaViewProps) {
                           {txn.entries.map((entry) => (
                             <span key={entry.id} className="entry-pill mono">
                               {entry.coa_account}: {formatINR(entry.amount)}
+                              {entry.units ? ` (${formatUnits(entry.units)} units)` : ""}
                             </span>
                           ))}
                         </div>
