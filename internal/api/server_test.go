@@ -1,7 +1,8 @@
-// Package api_test exercises ReconcileX's HTTP probes, /api/v1/personas endpoint,
-// error envelope formatting, and embedded SPA routing via httptest.NewRecorder.
+// Package api_test exercises ReconcileX's HTTP probes, /api/v1/personas,
+// ingestion queue endpoints, live ledger read endpoints, error envelope formatting,
+// and embedded SPA routing via httptest.NewRecorder.
 // Tests requiring PostgreSQL run against the isolated `test_api` schema inside
-// compose's ephemeral postgres-test instance so they never collide with internal/db tests.
+// compose's ephemeral postgres-test instance so they never collide with internal/db or worker tests.
 package api_test
 
 import (
@@ -402,7 +403,7 @@ func TestIngestJobsAccountsTransactionsAndPortfolioSummary(t *testing.T) {
 		t.Fatalf("POST /api/v1/ingest async schema failure expected 202, got %d: %s", dlqRec.Code, dlqRec.Body.String())
 	}
 
-	// Drain both jobs using worker pool.
+	// Drain both jobs using worker pool so Case 4–6 inspect COMPLETED and DEAD_LETTER state.
 	proc := worker.NewPool(pool, worker.Config{Concurrency: 1})
 	for i := 0; i < 2; i++ {
 		if claimed, err := proc.ProcessOne(ctx, "api-test-worker"); err != nil || !claimed {
@@ -410,7 +411,8 @@ func TestIngestJobsAccountsTransactionsAndPortfolioSummary(t *testing.T) {
 		}
 	}
 
-	// Also insert a second user ('priya') with a DEAD_LETTER job to verify persona scoping.
+	// Seed a second active persona ('priya') with her own DEAD_LETTER job so subsequent
+	// assertions verify strict persona isolation on jobs, accounts, and transactions.
 	var priyaID string
 	if err := pool.QueryRow(ctx,
 		`INSERT INTO users (persona_slug, display_name, status) VALUES ('priya', 'Priya Nair', 'ACTIVE') RETURNING id::text`,
@@ -515,7 +517,8 @@ func TestIngestJobsAccountsTransactionsAndPortfolioSummary(t *testing.T) {
 		t.Fatalf("unexpected transactions response: %+v", txnsResp.Transactions)
 	}
 
-	// Case 6: GET /api/v1/portfolio/summary?persona=aarav
+	// Case 6: GET /api/v1/portfolio/summary?persona=aarav returns fixed-point decimal
+	// totals (50000 - 1500 = 48500.0000) and counts only Aarav's DLQ job (1, not Priya's).
 	sumReq := httptest.NewRequest(http.MethodGet, "/api/v1/portfolio/summary?persona=aarav", nil)
 	sumRec := httptest.NewRecorder()
 	srv.ServeHTTP(sumRec, sumReq)

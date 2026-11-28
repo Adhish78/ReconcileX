@@ -1,3 +1,9 @@
+// Persona-scoped read-only ledger endpoints for ReconcileX.
+//
+// Owns GET /api/v1/accounts, GET /api/v1/accounts/{id}/transactions, and
+// GET /api/v1/portfolio/summary. All balances are computed live at read time from
+// ledger_entries using fixed-point NUMERIC(18,4) strings and money.Decimal4
+// arithmetic—never cached on accounts (ADR-0003).
 package api
 
 import (
@@ -11,7 +17,11 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-// AccountSummary represents a Financial Account with its live ledger balance.
+// -----------------------------------------------------------------------------
+// Response models
+// -----------------------------------------------------------------------------
+
+// AccountSummary represents a Financial Account with its live aggregated ledger balance.
 type AccountSummary struct {
 	ID                string     `json:"id"`
 	CanonicalUserID   string     `json:"canonical_user_id"`
@@ -28,7 +38,8 @@ type AccountSummary struct {
 	OpenAlertCount    int        `json:"open_alert_count"`
 }
 
-// LedgerEntryItem represents a single immutable entry leg returned in transaction drilldowns.
+// LedgerEntryItem represents a single immutable Chart of Accounts leg returned
+// inside transaction drilldowns.
 type LedgerEntryItem struct {
 	ID         string  `json:"id"`
 	CoaAccount string  `json:"coa_account"`
@@ -36,7 +47,8 @@ type LedgerEntryItem struct {
 	Units      *string `json:"units"`
 }
 
-// LedgerTransactionItem represents a zero-sum Ledger Transaction with nested entries.
+// LedgerTransactionItem represents a zero-sum Ledger Transaction paired with its
+// nested double-entry Ledger Entries.
 type LedgerTransactionItem struct {
 	ID             string            `json:"id"`
 	AccountID      string            `json:"account_id"`
@@ -67,6 +79,8 @@ type accountTransactionsResponse struct {
 	Total        int                     `json:"total"`
 }
 
+// accountsSummaryBreakdown breaks Net Worth assets and liabilities into fixed-point
+// decimal strings by Financial Account container type.
 type accountsSummaryBreakdown struct {
 	BankDeposits string `json:"bank_deposits"`
 	MutualFunds  string `json:"mutual_funds"`
@@ -75,6 +89,7 @@ type accountsSummaryBreakdown struct {
 	CreditCards  string `json:"credit_cards"`
 }
 
+// portfolioSummaryResponse mirrors the top-level Overview metrics card payload.
 type portfolioSummaryResponse struct {
 	Persona            personaSummary           `json:"persona"`
 	AsOf               string                   `json:"as_of"`
@@ -88,6 +103,12 @@ type portfolioSummaryResponse struct {
 	DLQJobCount        int                      `json:"dlq_job_count"`
 }
 
+// -----------------------------------------------------------------------------
+// Shared preconditions & persona resolution
+// -----------------------------------------------------------------------------
+
+// requirePool returns false and writes 503 ERR_DB_UNAVAILABLE when the handler is
+// invoked without an initialized database pool (such as isolated probe tests).
 func (s *server) requirePool(w http.ResponseWriter) bool {
 	if s.pool == nil {
 		writeError(w, http.StatusServiceUnavailable, errCodeDBUnavailable, "database connection is not initialized", nil)
@@ -96,6 +117,8 @@ func (s *server) requirePool(w http.ResponseWriter) bool {
 	return true
 }
 
+// resolvePersonaOrError looks up an ACTIVE Canonical User by slug (defaulting to
+// "aarav" when omitted) and writes 404 ERR_PERSONA_NOT_FOUND if missing or MERGED.
 func (s *server) resolvePersonaOrError(ctx context.Context, w http.ResponseWriter, slug string) (personaSummary, bool) {
 	if slug == "" {
 		slug = "aarav"
@@ -120,6 +143,14 @@ func (s *server) resolvePersonaOrError(ctx context.Context, w http.ResponseWrite
 	return p, true
 }
 
+// -----------------------------------------------------------------------------
+// Accounts & transaction drilldown handlers
+// -----------------------------------------------------------------------------
+
+// handleGetAccounts serves GET /api/v1/accounts?persona=<slug>.
+// Aggregates live ledger balances per Financial Account directly from ledger_entries,
+// filtering to asset and liability Chart of Accounts buckets so External Clearing
+// offsets are excluded.
 func (s *server) handleGetAccounts(w http.ResponseWriter, r *http.Request) {
 	if !s.requirePool(w) {
 		return
@@ -133,6 +164,8 @@ func (s *server) handleGetAccounts(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// LEFT JOIN ledger_entries so accounts with zero posted transactions still appear
+	// with "0.0000", and filter coa_account to principal/asset buckets (excluding clearing).
 	rows, err := s.pool.Query(ctx, `
 		SELECT
 			a.id::text,
@@ -182,6 +215,10 @@ func (s *server) handleGetAccounts(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, accountsListResponse{Accounts: accounts})
 }
 
+// handleGetAccountTransactions serves GET /api/v1/accounts/{id}/transactions.
+// Fetches a paginated slice of Ledger Transactions for the requested Financial Account
+// (enforcing optional ?persona= ownership) and batch-hydrates all nested Ledger Entries
+// in a second query to avoid N+1 round trips.
 func (s *server) handleGetAccountTransactions(w http.ResponseWriter, r *http.Request) {
 	if !s.requirePool(w) {
 		return
@@ -203,6 +240,8 @@ func (s *server) handleGetAccountTransactions(w http.ResponseWriter, r *http.Req
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 
+	// Step 1: When ?persona= is supplied, ensure the requested account belongs to that
+	// Canonical User; cross-persona lookups return 404 rather than leaking existence.
 	var userFilter string
 	if slug := strings.TrimSpace(q.Get("persona")); slug != "" {
 		persona, ok := s.resolvePersonaOrError(ctx, w, slug)
@@ -227,6 +266,7 @@ func (s *server) handleGetAccountTransactions(w http.ResponseWriter, r *http.Req
 		return
 	}
 
+	// Step 2: Count total transactions on the account and fetch the requested page newest-first.
 	var total int
 	if err := s.pool.QueryRow(ctx, `SELECT COUNT(*)::int FROM ledger_transactions WHERE account_id = $1`, accountID).Scan(&total); err != nil {
 		writeError(w, http.StatusServiceUnavailable, errCodeDBUnavailable, "failed to count transactions", map[string]any{"reason": err.Error()})
@@ -280,6 +320,8 @@ func (s *server) handleGetAccountTransactions(w http.ResponseWriter, r *http.Req
 		return
 	}
 
+	// Step 3: Hydrate double-entry legs for the page in a single ANY($1::uuid[]) query
+	// and attach each entry to its parent LedgerTransactionItem via indexByID.
 	if len(txnIDs) > 0 {
 		entryRows, err := s.pool.Query(ctx, `
 			SELECT
@@ -322,6 +364,13 @@ func (s *server) handleGetAccountTransactions(w http.ResponseWriter, r *http.Req
 	})
 }
 
+// -----------------------------------------------------------------------------
+// Portfolio summary handler
+// -----------------------------------------------------------------------------
+
+// handleGetPortfolioSummary serves GET /api/v1/portfolio/summary?persona=<slug>.
+// Aggregates asset and liability totals from ledger_entries using exact
+// money.Decimal4 arithmetic and attaches DLQ and uncategorized review counts.
 func (s *server) handleGetPortfolioSummary(w http.ResponseWriter, r *http.Request) {
 	if !s.requirePool(w) {
 		return
@@ -335,6 +384,7 @@ func (s *server) handleGetPortfolioSummary(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	// Step 1: Aggregate principal/cost ledger balances grouped by Financial Account source_type.
 	rows, err := s.pool.Query(ctx, `
 		SELECT
 			a.source_type::text,
@@ -352,6 +402,7 @@ func (s *server) handleGetPortfolioSummary(w http.ResponseWriter, r *http.Reques
 	}
 	defer rows.Close()
 
+	// Accumulate each container bucket in fixed-point Decimal4 without float64.
 	var bankDeposits, mutualFunds, equities, loans, creditCards money.Decimal4
 	for rows.Next() {
 		var srcType, amtStr string
@@ -386,6 +437,7 @@ func (s *server) handleGetPortfolioSummary(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	// Step 2: Derive TotalAssets, TotalLiabilities, and NetWorth (Assets - Liabilities).
 	totalAssets, err := bankDeposits.Add(mutualFunds)
 	if err == nil {
 		totalAssets, err = totalAssets.Add(equities)
@@ -407,6 +459,8 @@ func (s *server) handleGetPortfolioSummary(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	// Step 3: Fetch operational badge counts scoped to this Persona (DLQ jobs and
+	// transactions awaiting human review).
 	var dlqCount int
 	if err := s.pool.QueryRow(ctx, `
 		SELECT COUNT(*)::int

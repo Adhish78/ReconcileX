@@ -1,6 +1,7 @@
 // Package api implements ReconcileX's HTTP surface:
 //   - Liveness and readiness probes (`GET /healthz`, `GET /readyz`)
-//   - Versioned REST endpoints (`GET /api/v1/personas`, plus JSON 404 fallback under `/api/`)
+//   - Versioned REST endpoints (`GET /api/v1/personas`, `POST /api/v1/ingest`,
+//     `/api/v1/jobs*`, `/api/v1/accounts*`, `GET /api/v1/portfolio/summary`, plus JSON 404 fallback under `/api/`)
 //   - Embedded React SPA asset serving with client-side route fallback to `index.html`
 //
 // Constructed by cmd/reconcilex in production and tested directly via httptest in server_test.go.
@@ -81,7 +82,8 @@ func NewServer(pool *pgxpool.Pool, migrationsFS fs.FS, webFS fs.FS) http.Handler
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
 	mux.HandleFunc("GET /readyz", s.handleReadyz)
 
-	// Versioned REST API endpoints.
+	// Versioned REST API endpoints across personas (server.go), ingestion/jobs
+	// (ingest.go), and live double-entry read views (ledger_views.go).
 	mux.HandleFunc("GET /api/v1/personas", s.handleGetPersonas)
 	mux.HandleFunc("POST /api/v1/ingest", s.handlePostIngest)
 	mux.HandleFunc("GET /api/v1/jobs", s.handleGetJobs)
