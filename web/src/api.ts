@@ -5,6 +5,7 @@
 import type {
   AccountSummary,
   ApiErrorEnvelope,
+  JobDetail,
   JobSummary,
   LedgerTransactionItem,
   Persona,
@@ -33,8 +34,8 @@ async function parseErrorMessage(res: Response): Promise<string> {
  * Shared fetch wrapper that validates HTTP status, surfaces backend API error
  * envelopes via parseErrorMessage, and parses the JSON body as T.
  */
-async function fetchJSON<T>(url: string): Promise<T> {
-  const res = await fetch(url);
+async function fetchJSON<T>(url: string, init?: RequestInit): Promise<T> {
+  const res = init ? await fetch(url, init) : await fetch(url);
   if (!res.ok) {
     throw new Error(await parseErrorMessage(res));
   }
@@ -104,6 +105,34 @@ export async function fetchJobs(personaSlug = "", status = ""): Promise<JobSumma
   const qs = params.toString();
   const data = await fetchJSON<{ jobs?: JobSummary[] }>(`/api/v1/jobs${qs ? `?${qs}` : ""}`);
   return data.jobs ?? [];
+}
+
+/** Fetches full job detail including raw JSON payload for DLQ inspection. */
+export async function fetchJobDetail(jobId: string, personaSlug?: string): Promise<JobDetail> {
+  const qs = personaSlug ? `?persona=${encodeURIComponent(personaSlug)}` : "";
+  const data = await fetchJSON<{ job: JobDetail }>(
+    `/api/v1/jobs/${encodeURIComponent(jobId)}${qs}`
+  );
+  return data.job;
+}
+
+/** Replays a DEAD_LETTER job with an optional edited JSON object payload. */
+export async function replayJob(
+  jobId: string,
+  payload?: Record<string, unknown>,
+  personaSlug?: string
+): Promise<JobDetail> {
+  const qs = personaSlug ? `?persona=${encodeURIComponent(personaSlug)}` : "";
+  const body = payload !== undefined ? { payload } : {};
+  const data = await fetchJSON<{ job: JobDetail }>(
+    `/api/v1/jobs/${encodeURIComponent(jobId)}/replay${qs}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body)
+    }
+  );
+  return data.job;
 }
 
 /**

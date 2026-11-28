@@ -125,9 +125,19 @@ export interface JobSummary {
   attempt_count: number;
   max_attempts: number;
   replay_count: number;
+  next_run_at?: string;
+  replayed_at?: string | null;
   last_error_code: string | null;
   last_error_message: string | null;
   created_at: string;
   updated_at: string;
   completed_at: string | null;
+}
+
+/**
+ * Full ingestion_jobs record including raw JSON payload returned by
+ * GET /api/v1/jobs/{id} and POST /api/v1/jobs/{id}/replay.
+ */
+export interface JobDetail extends JobSummary {
+  payload: unknown;
 }
