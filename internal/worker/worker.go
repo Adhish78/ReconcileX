@@ -234,6 +234,22 @@ func (p *Pool) ProcessOne(ctx context.Context, workerID string) (bool, error) {
 			return true, p.handleProcessingError(ctx, job.ID, workerID, err)
 		}
 
+	case "AA_EQUITIES":
+		// Parse and validate the ReBIT AA EQUITIES payload before opening any DB writes.
+		parsed, err := aa.ParseEquities(job.Payload)
+		if err != nil {
+			return true, p.handleProcessingError(ctx, job.ID, workerID, err)
+		}
+
+		// Post demat account upsert, per-ISIN Opening Anchors, BUY/SELL & Corporate Action
+		// entries, and job completion in one atomic DB transaction.
+		if err := p.postEquitiesAndComplete(ctx, job, workerID, parsed); err != nil {
+			if errors.Is(err, ErrLeaseLost) {
+				return true, err
+			}
+			return true, p.handleProcessingError(ctx, job.ID, workerID, err)
+		}
+
 	case "CAS":
 		// Parse, validate, and run the pre-ledger Unit Checksum gate before opening any DB writes.
 		parsed, err := cas.Parse(job.Payload)
